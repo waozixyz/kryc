@@ -1,0 +1,23 @@
+# Binaries
+kryc
+*.exe
+*.out
+*.krb # Ignore build output if desired
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*~
+
+# Go build cache
+/vendor/
+go.work.sum
+
+# Nix files (optional, depends on workflow)
+# result*
+# .direnv/
