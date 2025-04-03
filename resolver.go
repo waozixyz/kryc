@@ -65,7 +65,7 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 			propHints[propDef.Name] = propDef.ValueTypeHint
 			if _, exists := mergedProps[propDef.Name]; !exists && propDef.DefaultValueStr != "" {
 
-				// --- ** FIX: Strip comment from default value before applying ** ---
+				// --- Strip comment from default value before applying ---
 				defaultValue := propDef.DefaultValueStr
 				trimmedDefaultBeforeCommentCheck := strings.TrimSpace(defaultValue)
 				commentIndexDef := -1; inQuotesDef := false
@@ -78,7 +78,7 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 					if commentIndexDef == 0 { finalDefaultValue = trimmedDefaultBeforeCommentCheck } else { finalDefaultValue = trimmedDefaultBeforeCommentCheck[:commentIndexDef] }
 				} else { finalDefaultValue = trimmedDefaultBeforeCommentCheck }
 				finalDefaultValue = strings.TrimSpace(finalDefaultValue) // Final trim
-				// --- ** END FIX ** ---
+				// --- END FIX ---
 
 				// Apply the cleaned default value
 				mergedProps[propDef.Name] = SourceProperty{
@@ -86,7 +86,8 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 					ValueStr: finalDefaultValue, // Use cleaned value
 					LineNum:  def.DefinitionStartLine,
 				}
-				log.Printf("L%d: Applying default value '%s' for property '%s' in component '%s'\n", el.SourceLineNum, finalDefaultValue, propDef.Name, def.Name)
+				// Optional log:
+				// log.Printf("L%d: Applying default value '%s' for property '%s' in component '%s'\n", el.SourceLineNum, finalDefaultValue, propDef.Name, def.Name)
 			}
 		}
 
@@ -154,6 +155,7 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
         // Add logic for other components that imply layout
 
 	} // --- End of Component Expansion ---
+
 
 	// --- 2. Resolve Standard Header Fields (ID, Pos, Size) ---
 	// These might be set directly or come from merged properties if expanded
@@ -344,32 +346,76 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 	// --- 4. Finalize Layout Byte ---
 	// Determine the effective layout byte, considering explicit layout, style, or component defaults
 	finalLayout := uint8(0)
-	if el.LayoutFlagsSource != 0 { // Explicit layout: property takes highest precedence
+	layoutExplicitlySet := false // Track if layout came from source or style
+
+	if el.LayoutFlagsSource != 0 { // 1. Explicit 'layout:' property takes highest precedence
 		finalLayout = el.LayoutFlagsSource
-	} else if el.StyleID > 0 && int(el.StyleID-1) < len(state.Styles) { // Check applied style
+		layoutExplicitlySet = true
+		// log.Printf("DEBUG LAYOUT FINAL: Elem %d using LayoutFlagsSource: 0x%X\n", el.SelfIndex, finalLayout)
+
+	} else if el.StyleID > 0 && int(el.StyleID-1) < len(state.Styles) { // 2. Check applied style
 		st := &state.Styles[el.StyleID-1]
-		layoutFoundInStyle := false
 		for _, prop := range st.Properties { // Use resolved properties from style
 			if prop.PropertyID == PropIDLayoutFlags && prop.ValueType == ValTypeByte && prop.Size == 1 {
 				finalLayout = prop.Value[0]
-				layoutFoundInStyle = true
+				layoutExplicitlySet = true // Style counts as explicit setting
+				// log.Printf("DEBUG LAYOUT FINAL: Elem %d using Style %d Layout: 0x%X\n", el.SelfIndex, el.StyleID, finalLayout)
 				break
 			}
 		}
-		// If style didn't define layout, fall back to component hints or global default
-		if !layoutFoundInStyle {
-            if el.IsComponentInstance && el.LayoutFlagsSource != 0 { // Check if component expansion set a default
-                 finalLayout = el.LayoutFlagsSource
-            } else {
-                 finalLayout = LayoutDirectionRow | LayoutAlignmentStart // Global default
-            }
-		}
-	} else if el.IsComponentInstance && el.LayoutFlagsSource != 0 { // Component hint if no style applied/defined layout
-         finalLayout = el.LayoutFlagsSource
-    } else { // Global default if nothing else specifies
-		finalLayout = LayoutDirectionRow | LayoutAlignmentStart
+		// Fall through if style didn't define layout
 	}
+	// Note: Removed check for component hint here, as explicit style/layout should override it.
+	// If neither explicit layout nor style layout is found, we proceed to check for implicit growth.
+
+	// *** NEW: Implicit Grow Logic (if not explicitly set above) ***
+	if !layoutExplicitlySet {
+		shouldImplicitlyGrow := false
+		// Check parent *only* if this element doesn't have explicit layout control
+		if el.ParentIndex != -1 {
+			parent := &state.Elements[el.ParentIndex]
+			// Parent grows ONLY if its *final resolved* Layout byte has the Grow bit
+			// AND the parent is part of the flow (absolute parents don't dictate flow growth)
+			parentIsFlow := (parent.Layout & LayoutAbsoluteBit) == 0
+			parentGrows := (parent.Layout & LayoutGrowBit) != 0
+
+			if parentGrows && parentIsFlow {
+				parentDir := parent.Layout & LayoutDirectionMask
+				// Apply implicit grow ONLY if parent grows AND this element is auto-sized
+				// in the parent's main flow direction.
+				if (parentDir == LayoutDirectionColumn || parentDir == LayoutDirectionColRev) && el.Height == 0 {
+					shouldImplicitlyGrow = true // Parent column implies child grows vertically if auto-height
+					// log.Printf("DEBUG LAYOUT FINAL: Elem %d IMPLICIT Grow (Parent E%d Col, Auto H)\n", el.SelfIndex, el.ParentIndex)
+				} else if (parentDir == LayoutDirectionRow || parentDir == LayoutDirectionRowRev) && el.Width == 0 {
+					shouldImplicitlyGrow = true // Parent row implies child grows horizontally if auto-width
+					// log.Printf("DEBUG LAYOUT FINAL: Elem %d IMPLICIT Grow (Parent E%d Row, Auto W)\n", el.SelfIndex, el.ParentIndex)
+				}
+			}
+		}
+
+		if shouldImplicitlyGrow {
+			// Apply Grow bit. We NEED to decide what base flags to use.
+			// Let's start with the GLOBAL default and just add the grow bit.
+			// This assumes children that implicitly grow default to row/start layout internally,
+			// which might be wrong. A better approach might be to inherit the parent's direction/alignment?
+			// For now, simplest approach: Add Grow to the global default.
+			finalLayout = (LayoutDirectionRow | LayoutAlignmentStart) | LayoutGrowBit
+			// log.Printf("DEBUG LAYOUT FINAL: Elem %d applied IMPLICIT Grow. Final Layout: 0x%X\n", el.SelfIndex, finalLayout)
+		} else {
+			// If no explicit layout and no implicit growth applied, use the global default
+			finalLayout = LayoutDirectionRow | LayoutAlignmentStart // Global default (Grow=false)
+			// log.Printf("DEBUG LAYOUT FINAL: Elem %d using Global Default Layout: 0x%X\n", el.SelfIndex, finalLayout)
+		}
+
+	} // *** END Implicit Grow Logic ***
+
+
 	el.Layout = finalLayout // Set the final Layout byte in the element header
+	log.Printf("   >> Elem %d ('%s') Final Layout Byte: 0x%02X (Dir:%d Align:%d Wrap:%t Grow:%t Abs:%t)\n",
+		el.SelfIndex, el.SourceElementName, el.Layout,
+		el.Layout&LayoutDirectionMask, (el.Layout&LayoutAlignmentMask)>>2,
+		(el.Layout&LayoutWrapBit) != 0, (el.Layout&LayoutGrowBit) != 0, (el.Layout&LayoutAbsoluteBit) != 0)
+
 
 	// --- 5. Recursively Resolve Children ---
 	el.Children = make([]*Element, 0, len(el.SourceChildrenIndices)) // Reset Children slice
@@ -392,47 +438,66 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 	return nil // Success for this element and its subtree
 }
 
-// resolveComponentsAndProperties is the entry point for pass 1.5.
+
 func (state *CompilerState) resolveComponentsAndProperties() error {
 	log.Println("Pass 1.5: Expanding components and resolving properties...")
 	for i := range state.Elements {
-		state.Elements[i].ProcessedInPass15 = false
+		state.Elements[i].ProcessedInPass15 = false // Reset processed flag for this pass
 	}
 	processedCount := 0
+	// We need to resolve roots first, which should cascade down.
+	// Find elements with no parent (ParentIndex == -1)
+	rootIndices := []int{}
 	for i := range state.Elements {
-		if !state.Elements[i].ProcessedInPass15 {
-			if err := state.resolveElementRecursive(i); err != nil {
-				return fmt.Errorf("error resolving element tree starting at index %d ('%s'): %w", i, state.Elements[i].SourceElementName, err)
-			}
-		}
-		currentProcessed := 0
-		for k := range state.Elements {
-			if state.Elements[k].ProcessedInPass15 {
-				currentProcessed++
-			}
-		}
-		processedCount = currentProcessed
-		if processedCount == len(state.Elements) {
-			break
+		if state.Elements[i].ParentIndex == -1 {
+			rootIndices = append(rootIndices, i)
 		}
 	}
-	if processedCount != len(state.Elements) {
-		log.Printf("Warning: %d elements processed, but total elements is %d. Potential disconnected elements.\n", processedCount, len(state.Elements))
-		for i := range state.Elements {
-			if !state.Elements[i].ProcessedInPass15 {
-				log.Printf("Attempting to resolve potentially disconnected element %d ('%s')\n", i, state.Elements[i].SourceElementName)
-				if err := state.resolveElementRecursive(i); err != nil {
-					return fmt.Errorf("error resolving unprocessed element %d ('%s'): %w", i, state.Elements[i].SourceElementName, err)
+
+	if len(rootIndices) == 0 && len(state.Elements) > 0 {
+        return fmt.Errorf("internal error: no root elements found (ParentIndex == -1) but elements exist")
+    }
+
+
+	for _, rootIndex := range rootIndices {
+		if !state.Elements[rootIndex].ProcessedInPass15 {
+			if err := state.resolveElementRecursive(rootIndex); err != nil {
+				// Provide context for which root element failed
+				rootName := "unknown"
+				if rootIndex >= 0 && rootIndex < len(state.Elements) {
+					rootName = state.Elements[rootIndex].SourceElementName
 				}
+				return fmt.Errorf("error resolving element tree starting at root index %d ('%s'): %w", rootIndex, rootName, err)
 			}
 		}
+	}
+
+	// Verify all elements were processed (should be covered by recursion from roots)
+	currentProcessed := 0
+	unprocessed := []int{}
+	for k := range state.Elements {
+		if state.Elements[k].ProcessedInPass15 {
+			currentProcessed++
+		} else {
+			unprocessed = append(unprocessed, k)
+		}
+	}
+	processedCount = currentProcessed
+
+	if processedCount != len(state.Elements) {
+		log.Printf("Warning: %d elements processed, but total elements is %d. Unprocessed indices: %v. Potential disconnected elements.", processedCount, len(state.Elements), unprocessed)
+		// Optionally, try resolving unprocessed ones directly, though it indicates a tree structure issue
+		// for _, idx := range unprocessed { ... state.resolveElementRecursive(idx) ... }
+        return fmt.Errorf("found %d unprocessed elements after resolving roots, indicates disconnected elements or error in recursion", len(unprocessed))
 	}
 	log.Printf("   Resolution Pass Complete. Final Element count: %d\n", len(state.Elements))
 	return nil
 }
 
+
 // Helper for ComponentDefinition to get a root property value
 func (def *ComponentDefinition) getRootPropertyValue(key string) (string, bool) {
+	// Search backwards to allow later definitions to override earlier ones if key is duplicated
 	for i := len(def.DefinitionRootProperties) - 1; i >= 0; i-- {
 		if def.DefinitionRootProperties[i].Key == key {
 			return def.DefinitionRootProperties[i].ValueStr, true
@@ -444,30 +509,48 @@ func (def *ComponentDefinition) getRootPropertyValue(key string) (string, bool) 
 // Helper function to log unhandled property warnings consistently
 func logUnhandledPropWarning(el *Element, key string, lineNum int) {
 	// Avoid warning about hints or already processed header fields again
+	// Also avoid warning about component-specific properties that were likely consumed
 	switch key {
-	case "orientation", "position", "id", "style", "pos_x", "pos_y", "width", "height", "layout", "onClick":
+	case "orientation", "position", "bar_style", "id", "style", "pos_x", "pos_y", "width", "height", "layout", "onClick", "on_click": // Added on_click
 		return
 	}
 	if el.IsComponentInstance && el.ComponentDef != nil {
-		hintFound := false
+		// Check if it was a defined property for the component
+		isDefinedProp := false
 		for _, propDef := range el.ComponentDef.Properties {
 			if propDef.Name == key {
-				hintFound = true
+				isDefinedProp = true
 				break
 			}
 		}
-		if hintFound {
-			log.Printf("L%d: Info: Property '%s' (defined in component '%s') not directly mapped to standard KRB property for element '%s'.\n", lineNum, key, el.ComponentDef.Name, el.SourceElementName)
+		if isDefinedProp {
+			// Suppress warnings for defined component properties that aren't directly mapped
+			// log.Printf("L%d: Info: Property '%s' (defined in component '%s') not directly mapped to standard KRB property for element '%s'.\n", lineNum, key, el.ComponentDef.Name, el.SourceElementName)
 		} else {
+			// Warn if it's an unknown property applied to a component instance
 			log.Printf("L%d: Warning: Unhandled property '%s' for element '%s' (component instance '%s').\n", lineNum, key, el.SourceElementName, el.ComponentDef.Name)
 		}
 	} else {
-		log.Printf("L%d: Warning: Unhandled property '%s' for element '%s'.\n", lineNum, key, el.SourceElementName)
+		// Warn for unhandled properties on standard elements
+		log.Printf("L%d: Warning: Unhandled property '%s' for standard element '%s'.\n", lineNum, key, el.SourceElementName)
 	}
 }
 
-// --- Pass 1.7: Adjust Layout (Ignoring Position) ---
+
+// --- Pass 1.7: Adjust Layout (Placeholder/Future) ---
+// This is where more complex adjustments like handling 'position: bottom' might go
+// if the renderer isn't expected to handle it purely based on element order.
 func (state *CompilerState) adjustLayoutForPosition() error {
-	log.Println("Pass 1.7: Adjust Layout for 'position' (Skipped - Renderer Handled).")
+	log.Println("Pass 1.7: Adjust Layout for 'position' (Skipped - No complex adjustments implemented).")
+	// // Example future logic:
+	// for i := range state.Elements {
+	// 	el := &state.Elements[i]
+	// 	if el.PositionHint != "" && el.ParentIndex != -1 {
+	// 		parent := &state.Elements[el.ParentIndex]
+	// 		// If el.PositionHint is "bottom" or "right", potentially reorder
+	// 		// parent.Children slice or adjust parent's layout flags (e.g., add Reverse).
+	// 		// This gets complicated quickly. Current approach relies on renderer + element order.
+	// 	}
+	// }
 	return nil
 }
