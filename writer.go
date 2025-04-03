@@ -177,7 +177,9 @@ func (state *CompilerState) writeKrbFile(filePath string) error {
 		if _, err := writer.Write(make([]byte, padding)); err != nil {
 			return fmt.Errorf("write header padding: %w", err)
 		}
-		if err := writer.Flush(); err != nil { return fmt.Errorf("flush after header padding: %w", err) }
+		if err := writer.Flush(); err != nil {
+			return fmt.Errorf("flush after header padding: %w", err)
+		}
 		currentPos += padding // Update our tracking variable
 	}
 	// Verify position after potential padding
@@ -287,7 +289,7 @@ func (state *CompilerState) writeKrbFile(filePath string) error {
 				// If parent offset is 0 (root App), child offset can be > 0.
 				// Can never be <=0 if child != parent.
 				if el.AbsoluteOffset > 0 || child.AbsoluteOffset > 0 { // Allow if both are truly 0? Unlikely.
-				    return fmt.Errorf("E%d C%d ('%s' -> '%s') has invalid relative offset %d (child_abs=%d, parent_abs=%d)", i, j, el.SourceElementName, child.SourceElementName, relativeOffset, child.AbsoluteOffset, el.AbsoluteOffset)
+					return fmt.Errorf("E%d C%d ('%s' -> '%s') has invalid relative offset %d (child_abs=%d, parent_abs=%d)", i, j, el.SourceElementName, child.SourceElementName, relativeOffset, child.AbsoluteOffset, el.AbsoluteOffset)
 				}
 				// If relativeOffset is 0 and both AbsoluteOffsets are 0, log warning? Assume ok for now.
 			}
@@ -406,10 +408,11 @@ func (state *CompilerState) writeKrbFile(filePath string) error {
 		currentPos = endPos
 	} else {
 		// If no strings, we still wrote the count(0), update position
-		if err := writer.Flush(); err != nil { return fmt.Errorf("flush after zero strings: %w", err) }
+		if err := writer.Flush(); err != nil {
+			return fmt.Errorf("flush after zero strings: %w", err)
+		}
 		currentPos += 2 // For the count field
 	}
-
 
 	// --- Write Resource Table ---
 	log.Printf("    Writing %d resources at offset %d\n", len(state.Resources), state.ResourceOffset)
@@ -450,10 +453,11 @@ func (state *CompilerState) writeKrbFile(filePath string) error {
 		currentPos = endPos
 	} else {
 		// If no resources, we still wrote the count(0), update position
-		if err := writer.Flush(); err != nil { return fmt.Errorf("flush after zero resources: %w", err) }
+		if err := writer.Flush(); err != nil {
+			return fmt.Errorf("flush after zero resources: %w", err)
+		}
 		currentPos += 2 // For the count field
 	}
-
 
 	// --- Final Flush and Size Check ---
 	if err := writer.Flush(); err != nil { // Final flush before checking size
@@ -471,7 +475,6 @@ func (state *CompilerState) writeKrbFile(filePath string) error {
 	if uint32(currentPos) != state.TotalSize { // Also check our tracked position
 		return fmt.Errorf("final tracked position mismatch: tracked pos %d != calculated total size %d", currentPos, state.TotalSize)
 	}
-
 
 	return nil // Success
 }

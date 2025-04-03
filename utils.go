@@ -163,3 +163,28 @@ func parseLayoutString(layoutStr string) uint8 {
 	}
 	return b
 }
+
+func (style *StyleEntry) addSourceProperty(key, value string, lineNum int) error {
+	// Check if extends is specified multiple times or after other properties (optional strictness)
+	if key == "extends" {
+		if style.ExtendsStyleName != "" {
+			return fmt.Errorf("style '%s' specifies 'extends' multiple times", style.SourceName)
+		}
+		// Optional: Check if it's the first property
+		// if len(style.SourceProperties) > 0 {
+		// 	 log.Printf("L%d: Warning: 'extends' should ideally be the first property in style '%s'\n", lineNum, style.SourceName)
+		// }
+	} else if style.ExtendsStyleName != "" && len(style.SourceProperties) == 0 {
+		// If extends was set, but this is the first non-extends property
+		// This helps enforce the "extends first" convention slightly
+	}
+
+	// Overwrite if key exists? Or just append? Let's append for now.
+	// Resolution pass will handle overrides.
+	if len(style.SourceProperties) >= MaxProperties { // Use MaxProperties as a general limit
+		return fmt.Errorf("L%d: maximum source properties (%d) exceeded for style '%s'", lineNum, MaxProperties, style.SourceName)
+	}
+	prop := SourceProperty{Key: key, ValueStr: value, LineNum: lineNum}
+	style.SourceProperties = append(style.SourceProperties, prop)
+	return nil
+}

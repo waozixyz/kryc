@@ -154,7 +154,7 @@ type KrbProperty struct {
 type SourceProperty struct {
 	Key      string
 	ValueStr string
-	LineNum  int // Keep track of source line for errors
+	LineNum  int
 }
 
 type ComponentPropertyDef struct {
@@ -193,12 +193,16 @@ type ComponentDefinition struct {
 }
 
 type StyleEntry struct {
-	ID             uint8         // 1-based ID
-	NameIndex      uint8         // 0-based string index
-	Properties     []KrbProperty // Resolved KRB properties
-	SourceName     string        // Keep source name for lookup
-	CalculatedSize uint32
-	// Removed explicit property count, use len()
+	ID               uint8         // 1-based ID
+	NameIndex        uint8         // 0-based string index
+	Properties       []KrbProperty // Resolved KRB properties (AFTER inheritance)
+	SourceName       string        // Keep source name for lookup
+	CalculatedSize   uint32
+	SourceProperties []SourceProperty // Store raw properties read from source BEFORE resolving inheritance
+	ExtendsStyleName string           // Name of the style this one extends (if any)
+	BaseStyleID      uint8            // 1-based ID of the base style (resolved later)
+	IsResolved       bool             // Flag used during inheritance resolution pass
+	IsResolving      bool             // Flag for cycle detection during resolution
 }
 
 type Element struct {
