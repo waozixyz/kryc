@@ -81,22 +81,25 @@ const (
 // Value Types (0x00 - 0x0B + Internal Hints)
 const (
 	ValTypeNone       uint8 = 0x00
-	ValTypeByte       uint8 = 0x01 // Also used for Bool
-	ValTypeShort      uint8 = 0x02
+	ValTypeByte       uint8 = 0x01 // Also used for Bool in KRB
+	ValTypeShort      uint8 = 0x02 // Also used for Int in KRB
 	ValTypeColor      uint8 = 0x03
-	ValTypeString     uint8 = 0x04
-	ValTypeResource   uint8 = 0x05
-	ValTypePercentage uint8 = 0x06
-	ValTypeRect       uint8 = 0x07
-	ValTypeEdgeInsets uint8 = 0x08
-	ValTypeEnum       uint8 = 0x09
-	ValTypeVector     uint8 = 0x0A
-	ValTypeCustom     uint8 = 0x0B
-	// Internal hint types (not written to KRB directly as types)
-	ValTypeStyleID uint8 = 0x0C // Internal hint type for StyleID strings
-	ValTypeFloat   uint8 = 0x0D // Internal hint type for parsing floats
-)
+	ValTypeString     uint8 = 0x04 // Represents String Index
+	ValTypeResource   uint8 = 0x05 // Represents Resource Index
+	ValTypePercentage uint8 = 0x06 // Represents 8.8 Fixed Point (uint16)
+	ValTypeRect       uint8 = 0x07 // Example: 4 shorts (8 bytes)
+	ValTypeEdgeInsets uint8 = 0x08 // Example: 4 bytes/shorts
+	ValTypeEnum       uint8 = 0x09 // Specific meaning depends on PropID
+	ValTypeVector     uint8 = 0x0A // Example: 2 shorts (4 bytes)
+	ValTypeCustom     uint8 = 0x0B // Application-specific binary data
 
+	// --- Internal Compiler Hint Types (Not written directly as ValueType in KRB) ---
+	// These hints help the resolver convert source values for custom properties.
+	ValTypeStyleID uint8 = 0x0C // Hint for a string representing a Style Name
+	ValTypeFloat   uint8 = 0x0D // Hint for parsing standard float strings
+	ValTypeInt     uint8 = 0x0E // Hint for parsing standard integer strings (maps to ValTypeShort in KRB)
+	ValTypeBool    uint8 = 0x0F // Hint for parsing "true"/"false" strings (maps to ValTypeByte in KRB)
+)
 // Event Types (0x01 - ...)
 const (
 	EventTypeClick uint8 = 0x01
@@ -205,6 +208,15 @@ type StyleEntry struct {
 	IsResolving      bool             // Flag for cycle detection during resolution
 }
 
+type KrbCustomProperty struct {
+	KeyIndex   uint8  // String table index for the property key name
+	ValueType  uint8  // VAL_TYPE_* for the value
+	ValueSize  uint8  // Size of the value data in bytes
+	Value      []byte // The actual value data
+}
+
+
+// Represents a UI element in the compiler's internal state
 type Element struct {
 	// Header Data (KRB v0.3 compatible - filled during write phase)
 	Type            uint8
@@ -213,18 +225,19 @@ type Element struct {
 	PosY            uint16
 	Width           uint16
 	Height          uint16
-	Layout          uint8
+	Layout          uint8 // Final calculated layout byte
 	StyleID         uint8 // 0 if no style
-	PropertyCount   uint8 // Final count of KRB properties
+	PropertyCount   uint8 // Final count of *standard* KRB properties
 	ChildCount      uint8
 	EventCount      uint8
 	AnimationCount  uint8 // Usually 0
-	CustomPropCount uint8 // Usually 0
+	CustomPropCount uint8 // Count of *custom* KRB properties *** (Added in v0.3 spec) ***
 
 	// Resolved Data (converted to KRB format)
-	KrbProperties []KrbProperty
-	KrbEvents     []KrbEvent
-	Children      []*Element // Points to elements in the *final* resolved array
+	KrbProperties       []KrbProperty       // Slice for STANDARD properties
+	KrbCustomProperties []KrbCustomProperty // *** NEW *** Slice for CUSTOM properties
+	KrbEvents           []KrbEvent
+	Children            []*Element // Points to elements in the *final* resolved array
 
 	// Compiler Internal State & Source Info
 	ParentIndex         int // Index of parent in CompilerState.Elements, -1 for root
@@ -233,31 +246,28 @@ type Element struct {
 	ComponentDef        *ComponentDefinition // Points to definition if is_component_instance
 	SourceElementName   string               // "App", "Container", "TabBar", etc. from .kry
 	SourceIDName        string               // "my_button" from `id: "my_button"`
-	// source_style_name removed, StyleID is sufficient after resolution
-	SourceProperties      []SourceProperty // Store props found in .kry block
-	SourceChildrenIndices []int            // Store indices during parsing
+	SourceProperties    []SourceProperty     // Store props found in .kry block
+	SourceChildrenIndices []int              // Store indices during parsing
 	SourceLineNum         int
-	LayoutFlagsSource     uint8  // Layout byte derived from .kry 'layout:' property
-	PositionHint          string // Stores "top", "bottom", etc. (Compiler hint, not written)
-	OrientationHint       string // Stores "row", "column" etc. (Compiler hint, not written)
+	LayoutFlagsSource     uint8  // Layout byte derived *directly* from .kry 'layout:' property
+	PositionHint          string // Stores "top", "bottom", etc. (Only used for simple child reorder hint during write)
+	OrientationHint       string // Stores "row", "column" etc. (No longer directly sets Layout byte)
 
 	// Pass 2/3 Data
 	CalculatedSize uint32 // Calculated size in bytes for the KRB output
 	AbsoluteOffset uint32 // Calculated offset in the final KRB file
-	// Removed explicit source counts/property counts, use len()
 
 	// Pass 1.5 Tracking
 	ProcessedInPass15 bool
 }
 
+// Represents the overall compiler state
 type CompilerState struct {
 	Elements      []Element // Use slice
 	Strings       []StringEntry
 	Styles        []StyleEntry
 	Resources     []ResourceEntry
 	ComponentDefs []ComponentDefinition
-
-	// Removed counts, use len()
 
 	HasApp      bool
 	HeaderFlags uint16

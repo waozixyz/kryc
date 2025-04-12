@@ -437,8 +437,9 @@ func (state *CompilerState) addStyleKrbStringProperty(style *StyleEntry, propID 
 	return style.addStyleKrbProperty(propID, ValTypeString, []byte{idx})
 }
 
-// getSourcePropertyValue retrieves the value string for a given key from an element's source properties.
+// getSourcePropertyValue retrieves the last value string for a given key from an element's source properties.
 func (el *Element) getSourcePropertyValue(key string) (string, bool) {
+	// Search backwards to respect potential overrides during property merging
 	for i := len(el.SourceProperties) - 1; i >= 0; i-- {
 		if el.SourceProperties[i].Key == key {
 			return el.SourceProperties[i].ValueStr, true

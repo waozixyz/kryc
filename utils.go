@@ -100,65 +100,56 @@ func getElementTypeFromName(name string) uint8 {
 		return ElemTypeUnknown // Indicates potential custom component or unknown type
 	}
 }
-
-// Helper to parse layout string like "row center wrap grow"
 func parseLayoutString(layoutStr string) uint8 {
 	var b uint8 = 0
 	parts := strings.Fields(layoutStr) // Split by whitespace
+	hasExplicitDirection := false
 
-	// Direction (last one wins if multiple specified)
-	dirSet := false
+	// Pass 1: Check for explicit direction
 	for _, part := range parts {
 		switch part {
-		case "row":
-			b = (b &^ LayoutDirectionMask) | LayoutDirectionRow
-			dirSet = true
-		case "col", "column":
-			b = (b &^ LayoutDirectionMask) | LayoutDirectionColumn
-			dirSet = true
-		case "row_rev", "row-rev":
-			b = (b &^ LayoutDirectionMask) | LayoutDirectionRowRev
-			dirSet = true
-		case "col_rev", "col-rev", "column-rev":
-			b = (b &^ LayoutDirectionMask) | LayoutDirectionColRev
-			dirSet = true
+		case "row", "col", "column", "row_rev", "row-rev", "col_rev", "col-rev", "column-rev":
+			hasExplicitDirection = true
+			break // Found one, no need to check further in this pass
 		}
 	}
-	if !dirSet {
-		b |= LayoutDirectionRow
-	} // Default to row if not specified
 
-	// Alignment (last one wins)
+	// Apply Direction (or default to COLUMN if no explicit direction found)
+	dirSet := false
+	if hasExplicitDirection {
+		for _, part := range parts { // Find the last specified direction
+			switch part {
+			case "row":				b = (b &^ LayoutDirectionMask) | LayoutDirectionRow; dirSet = true
+			case "col", "column": 	b = (b &^ LayoutDirectionMask) | LayoutDirectionColumn; dirSet = true
+			case "row_rev", "row-rev": b = (b &^ LayoutDirectionMask) | LayoutDirectionRowRev; dirSet = true
+			case "col_rev", "col-rev", "column-rev": b = (b &^ LayoutDirectionMask) | LayoutDirectionColRev; dirSet = true
+			}
+		}
+	}
+	if !dirSet { // If no explicit direction was found anywhere
+		b |= LayoutDirectionColumn // <<< DEFAULT TO COLUMN
+	}
+
+	// Apply Alignment (last one wins)
 	alignSet := false
 	for _, part := range parts {
 		switch part {
-		case "start":
-			b = (b &^ LayoutAlignmentMask) | LayoutAlignmentStart
-			alignSet = true
-		case "center", "centre":
-			b = (b &^ LayoutAlignmentMask) | LayoutAlignmentCenter
-			alignSet = true
-		case "end":
-			b = (b &^ LayoutAlignmentMask) | LayoutAlignmentEnd
-			alignSet = true
-		case "space_between", "space-between":
-			b = (b &^ LayoutAlignmentMask) | LayoutAlignmentSpaceBtn
-			alignSet = true
+		case "start":			b = (b &^ LayoutAlignmentMask) | LayoutAlignmentStart; alignSet = true
+		case "center", "centre": b = (b &^ LayoutAlignmentMask) | LayoutAlignmentCenter; alignSet = true
+		case "end": 			b = (b &^ LayoutAlignmentMask) | LayoutAlignmentEnd; alignSet = true
+		case "space_between", "space-between": b = (b &^ LayoutAlignmentMask) | LayoutAlignmentSpaceBtn; alignSet = true
 		}
 	}
 	if !alignSet {
-		b |= LayoutAlignmentStart
-	} // Default to start if not specified
+		b |= LayoutAlignmentStart // Default to start if not specified
+	}
 
-	// Flags
+	// Apply Flags
 	for _, part := range parts {
 		switch part {
-		case "wrap":
-			b |= LayoutWrapBit
-		case "grow":
-			b |= LayoutGrowBit
-		case "absolute":
-			b |= LayoutAbsoluteBit
+		case "wrap":		b |= LayoutWrapBit
+		case "grow":		b |= LayoutGrowBit
+		case "absolute":	b |= LayoutAbsoluteBit
 		}
 	}
 	return b
