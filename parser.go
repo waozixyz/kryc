@@ -230,14 +230,30 @@ func (state *CompilerState) parseKrySource(sourceBuffer string) error {
 				if len(parentComponentDef.Properties) >= MaxProperties { return fmt.Errorf("L%d: max properties defined", currentLineNum) }
 				pd := ComponentPropertyDef{Name: key, DefaultValueStr: propDefault}; switch propType { case "String": pd.ValueTypeHint = ValTypeString; case "Int": pd.ValueTypeHint = ValTypeShort; case "Bool": pd.ValueTypeHint = ValTypeByte; case "Color": pd.ValueTypeHint = ValTypeColor; case "StyleID": pd.ValueTypeHint = ValTypeStyleID; case "Resource": pd.ValueTypeHint = ValTypeResource; case "Float": pd.ValueTypeHint = ValTypeFloat; default: log.Printf("L%d: Warn: Unknown prop type hint '%s' for '%s'", currentLineNum, propType, key); pd.ValueTypeHint = ValTypeCustom }; parentComponentDef.Properties = append(parentComponentDef.Properties, pd)
 
-			case CtxStyle: // Inside style "name" { }
-				if startsWithElement { log.Printf("L%d: Warning: Ignoring line starting like element inside Style block: '%s'", currentLineNum, trimmed); continue }
-				if !isPropertyLike { return fmt.Errorf("L%d: invalid property syntax inside Style block (expected 'key: value'): '%s'", currentLineNum, trimmed) }
-				key := keyPart; valueStr := strings.TrimSpace(parts[1]) // Keep quotes/spacing for addSourceProperty
-				parentStyle := contextObject.(*StyleEntry)
-				err := parentStyle.addSourceProperty(key, valueStr, currentLineNum); if err != nil { return fmt.Errorf("L%d: %w", currentLineNum, err) }
-				if key == "extends" { baseName := trimQuotes(strings.TrimSpace(valueStr)); if baseName == "" { return fmt.Errorf("L%d: 'extends' requires non-empty base style name in style '%s'", currentLineNum, parentStyle.SourceName) }; if baseName == parentStyle.SourceName { return fmt.Errorf("L%d: style '%s' cannot extend itself", currentLineNum, parentStyle.SourceName) }; parentStyle.ExtendsStyleName = baseName }
 
+			case CtxStyle: // Inside style "name" { }
+				if !isPropertyLike { return fmt.Errorf("L%d: invalid property syntax inside Style block (expected 'key: value'): '%s'", currentLineNum, trimmed) }
+				key := keyPart; valueStrRaw := strings.TrimSpace(parts[1]) // Keep raw value for addSourceProperty if needed
+				if contextObject == nil { return fmt.Errorf("L%d: internal error: nil context for CtxStyle", currentLineNum) }
+				parentStyle := contextObject.(*StyleEntry)
+
+				// *** Process 'extends' specifically ***
+				if key == "extends" {
+					// Clean the value to get the base name *without* comments or quotes
+					baseName, _ := cleanAndQuoteValue(valueStrRaw) // Use helper
+					if baseName == "" { return fmt.Errorf("L%d: 'extends' requires non-empty base style name in style '%s'", currentLineNum, parentStyle.SourceName) }
+					if baseName == parentStyle.SourceName { return fmt.Errorf("L%d: style '%s' cannot extend itself", currentLineNum, parentStyle.SourceName) }
+					if parentStyle.ExtendsStyleName != "" { return fmt.Errorf("L%d: style '%s' specifies 'extends' multiple times", currentLineNum, parentStyle.SourceName) }
+
+					// Store the CLEANED base name
+					parentStyle.ExtendsStyleName = baseName
+					log.Printf("   Parsed Style Extends: %s -> %s\n", parentStyle.SourceName, baseName)
+					// NOTE: We DO NOT call addSourceProperty for 'extends' itself.
+				} else {
+					// For all OTHER properties, add them to the source list
+					err := parentStyle.addSourceProperty(key, valueStrRaw, currentLineNum); if err != nil { return fmt.Errorf("L%d: %w", currentLineNum, err) }
+					log.Printf("   Parsed Style Property: %s = %s\n", key, valueStrRaw)
+				}
 			case CtxElement: // Inside Element { }
 				if startsWithElement { log.Printf("L%d: Warning: Ignoring line starting like element inside Element block '%s': '%s'", currentLineNum, contextObject.(*Element).SourceElementName, trimmed); continue }
 				if !isPropertyLike { return fmt.Errorf("L%d: invalid property syntax inside Element '%s' (expected 'key: value'): '%s'", currentLineNum, contextObject.(*Element).SourceElementName, trimmed) }
