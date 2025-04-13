@@ -13,7 +13,6 @@ Compiler for the KRY UI description language, producing KRB v0.3 binary files.
 ## Requirements
 
 *   Go toolchain (>= 1.18 recommended)
-*   (Optional, Recommended) [Nix](https://nixos.org/) with Flakes enabled
 
 ## Building
 
