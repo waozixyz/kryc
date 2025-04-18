@@ -250,10 +250,13 @@ func (state *CompilerState) parseKrySource(sourceBuffer string) error {
 					log.Printf("   Parsed Style Extends: %s -> %s\n", parentStyle.SourceName, baseName)
 					// NOTE: We DO NOT call addSourceProperty for 'extends' itself.
 				} else {
-					// For all OTHER properties, add them to the source list
-					err := parentStyle.addSourceProperty(key, valueStrRaw, currentLineNum); if err != nil { return fmt.Errorf("L%d: %w", currentLineNum, err) }
-					log.Printf("   Parsed Style Property: %s = %s\n", key, valueStrRaw)
+					// Call the method directly on the style entry
+					err := parentStyle.addSourceProperty(key, valueStrRaw, currentLineNum) // Calls method defined in constants.go
+					if err != nil {
+						return fmt.Errorf("L%d: %w", currentLineNum, err)
+					}
 				}
+			
 			case CtxElement: // Inside Element { }
 				if startsWithElement { log.Printf("L%d: Warning: Ignoring line starting like element inside Element block '%s': '%s'", currentLineNum, contextObject.(*Element).SourceElementName, trimmed); continue }
 				if !isPropertyLike { return fmt.Errorf("L%d: invalid property syntax inside Element '%s' (expected 'key: value'): '%s'", currentLineNum, contextObject.(*Element).SourceElementName, trimmed) }

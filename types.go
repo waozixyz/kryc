@@ -1,5 +1,9 @@
 package main
 
+import (
+	"fmt"
+)
+
 // --- KRB v0.3 Constants ---
 const (
 	KRBMagic             = "KRB1"
@@ -123,8 +127,13 @@ const (
 )
 
 // Resource Types & Formats
+
 const (
 	ResTypeImage      uint8 = 0x01
+	ResTypeFont       uint8 = 0x02 
+	ResTypeSound      uint8 = 0x03 
+	ResTypeVideo      uint8 = 0x04
+	ResTypeCustom     uint8 = 0x05 
 	ResFormatExternal uint8 = 0x00
 	ResFormatInline   uint8 = 0x01 // Not implemented
 )
@@ -207,6 +216,30 @@ type StyleEntry struct {
 	IsResolved       bool             // Flag used during inheritance resolution pass
 	IsResolving      bool             // Flag for cycle detection during resolution
 }
+
+
+// addSourceProperty adds a raw key-value pair from the .kry source to a style entry.
+func (style *StyleEntry) addSourceProperty(key, value string, lineNum int) error {
+	// Optional strictness checks (can be commented out if preferred)
+	// if key == "extends" {
+	//	if style.ExtendsStyleName != "" {
+	//		return fmt.Errorf("style '%s' specifies 'extends' multiple times", style.SourceName)
+	//	}
+	//	// Optional: Check if it's the first property
+	//	// if len(style.SourceProperties) > 0 {
+	//	// 	 log.Printf("L%d: Warning: 'extends' should ideally be the first property in style '%s'\n", lineNum, style.SourceName)
+	//	// }
+	// }
+
+	// Append the raw source property. Resolution pass will handle overrides.
+	if len(style.SourceProperties) >= MaxProperties { // Use MaxProperties as a general limit
+		return fmt.Errorf("L%d: maximum source properties (%d) exceeded for style '%s'", lineNum, MaxProperties, style.SourceName)
+	}
+	prop := SourceProperty{Key: key, ValueStr: value, LineNum: lineNum}
+	style.SourceProperties = append(style.SourceProperties, prop)
+	return nil
+}
+
 
 type KrbCustomProperty struct {
 	KeyIndex   uint8  // String table index for the property key name

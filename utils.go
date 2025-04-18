@@ -1,12 +1,62 @@
+// utils.go
 package main
 
 import (
 	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
 	"strings"
+	"io"
 )
+
+// --- String/Value Cleaning ---
+
+// trimQuotes removes leading/trailing double quotes if present
+func trimQuotes(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// cleanAndQuoteValue removes comments, trims space, and returns both the fully cleaned value
+// (for parsing numbers, bools etc.) and a version with only outer quotes trimmed (for string table lookups).
+func cleanAndQuoteValue(valStr string) (cleanVal, quotedVal string) {
+	valuePart := valStr
+	// Trim initial whitespace before checking for comments
+	trimmedValueBeforeCommentCheck := strings.TrimSpace(valuePart)
+
+	commentIndex := -1
+	inQuotes := false
+	// Scan for '#' that marks a comment, ignoring # inside quotes or at the start (hex color)
+	for i, r := range trimmedValueBeforeCommentCheck {
+		if r == '"' {
+			// Basic quote toggling, doesn't handle escaped quotes
+			inQuotes = !inQuotes
+		}
+		// '#' is a comment if not inside quotes and not the very first character
+		if r == '#' && !inQuotes && i > 0 {
+			commentIndex = i
+			break
+		}
+	}
+
+	// Slice the string if a valid comment marker was found
+	if commentIndex > 0 {
+		valuePart = trimmedValueBeforeCommentCheck[:commentIndex]
+	} else {
+		// Use the already trimmed string if no comment found (or comment was invalid)
+		valuePart = trimmedValueBeforeCommentCheck
+	}
+
+	// Final trim after potentially removing the comment part
+	cleanVal = strings.TrimSpace(valuePart)
+	// Separately trim just the outer quotes from the cleaned value for string lookup
+	quotedVal = trimQuotes(cleanVal)
+	return
+}
+
+// --- Binary Writing Helpers ---
 
 // Helper for writing binary data
 func writeUint8(w io.Writer, value uint8) error {
@@ -21,22 +71,19 @@ func writeUint32(w io.Writer, value uint32) error {
 	return binary.Write(w, binary.LittleEndian, value)
 }
 
-// trimQuotes removes leading/trailing double quotes if present
-func trimQuotes(s string) string {
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return s[1 : len(s)-1]
-	}
-	return s
-}
+// --- Parsing Helpers ---
 
 // parseColor converts "#RRGGBBAA" or "#RGB" etc. to [4]uint8 {R, G, B, A}
 func parseColor(valueStr string) ([4]uint8, bool) {
 	c := [4]uint8{0, 0, 0, 255} // Default alpha to 255
-	if !strings.HasPrefix(valueStr, "#") {
-		log.Printf("Warning: Invalid color format (missing #): '%s'\n", valueStr)
+	cleanVal := strings.TrimSpace(valueStr) // Trim space first
+
+	if !strings.HasPrefix(cleanVal, "#") {
+		// Allow named colors in the future? For now, require #
+		// log.Printf("Warning: Invalid color format (missing #): '%s'\n", valueStr)
 		return c, false
 	}
-	hexStr := valueStr[1:]
+	hexStr := cleanVal[1:]
 	var r, g, b, a uint64
 	var err error
 
@@ -53,13 +100,13 @@ func parseColor(valueStr string) ([4]uint8, bool) {
 			c[0], c[1], c[2] = uint8(r), uint8(g), uint8(b)
 			return c, true
 		}
-	case 4: // RGBA
+	case 4: // RGBA shorthand
 		_, err = fmt.Sscanf(hexStr, "%1x%1x%1x%1x", &r, &g, &b, &a)
 		if err == nil {
 			c[0], c[1], c[2], c[3] = uint8(r*16+r), uint8(g*16+g), uint8(b*16+b), uint8(a*16+a)
 			return c, true
 		}
-	case 3: // RGB
+	case 3: // RGB shorthand
 		_, err = fmt.Sscanf(hexStr, "%1x%1x%1x", &r, &g, &b)
 		if err == nil {
 			c[0], c[1], c[2] = uint8(r*16+r), uint8(g*16+g), uint8(b*16+b)
@@ -68,7 +115,23 @@ func parseColor(valueStr string) ([4]uint8, bool) {
 	}
 
 	log.Printf("Warning: Invalid color format '%s', Error: %v\n", valueStr, err)
-	return c, false
+	return c, false // Return default black on error
+}
+
+func guessResourceType(key string) uint8 {
+	lowerKey := strings.ToLower(key)
+	if strings.Contains(lowerKey, "image") || strings.Contains(lowerKey, "icon") || strings.Contains(lowerKey, "sprite") || strings.Contains(lowerKey, "texture") || strings.Contains(lowerKey, "background") || strings.Contains(lowerKey, "logo") || strings.Contains(lowerKey, "avatar") {
+		return ResTypeImage
+	}
+	if strings.Contains(lowerKey, "font") {
+		return ResTypeFont // Assuming ResTypeFont is defined in constants.go
+	}
+	if strings.Contains(lowerKey, "sound") || strings.Contains(lowerKey, "audio") || strings.Contains(lowerKey, "music") {
+		return ResTypeSound // Assuming ResTypeSound is defined in constants.go
+	}
+	// Add other guesses if needed based on common key names
+	// Default guess if no strong hints found - Image is often a safe default.
+	return ResTypeImage
 }
 
 // getElementTypeFromName maps standard KRY element names to KRB type IDs
@@ -97,85 +160,86 @@ func getElementTypeFromName(name string) uint8 {
 	case "Video":
 		return ElemTypeVideo
 	default:
-		return ElemTypeUnknown // Indicates potential custom component or unknown type
+		// It might be a component name or a truly unknown type.
+		// The parser handles component lookup; resolver handles unknown standard types.
+		return ElemTypeUnknown
 	}
 }
-func parseLayoutString(layoutStr string) uint8 {
-	var b uint8 = 0
-	parts := strings.Fields(layoutStr) // Split by whitespace
-	hasExplicitDirection := false
 
-	// Pass 1: Check for explicit direction
+// parseLayoutString converts a space-separated layout string (e.g., "row center wrap grow")
+// into the final KRB Layout byte.
+func parseLayoutString(layoutStr string) uint8 {
+	var b uint8 = 0 // Start with 0
+	parts := strings.Fields(layoutStr)
+	hasExplicitDirection := false
+	hasExplicitAlignment := false
+
+	// Pass 1: Check for explicit direction and alignment
 	for _, part := range parts {
 		switch part {
 		case "row", "col", "column", "row_rev", "row-rev", "col_rev", "col-rev", "column-rev":
 			hasExplicitDirection = true
-			break // Found one, no need to check further in this pass
+		case "start", "center", "centre", "end", "space_between", "space-between":
+			hasExplicitAlignment = true
 		}
 	}
 
-	// Apply Direction (or default to COLUMN if no explicit direction found)
-	dirSet := false
+	// Apply Direction (last one wins if multiple specified)
 	if hasExplicitDirection {
-		for _, part := range parts { // Find the last specified direction
+		for _, part := range parts {
 			switch part {
-			case "row":				b = (b &^ LayoutDirectionMask) | LayoutDirectionRow; dirSet = true
-			case "col", "column": 	b = (b &^ LayoutDirectionMask) | LayoutDirectionColumn; dirSet = true
-			case "row_rev", "row-rev": b = (b &^ LayoutDirectionMask) | LayoutDirectionRowRev; dirSet = true
-			case "col_rev", "col-rev", "column-rev": b = (b &^ LayoutDirectionMask) | LayoutDirectionColRev; dirSet = true
+			case "row":
+				b = (b &^ LayoutDirectionMask) | LayoutDirectionRow
+			case "col", "column":
+				b = (b &^ LayoutDirectionMask) | LayoutDirectionColumn
+			case "row_rev", "row-rev":
+				b = (b &^ LayoutDirectionMask) | LayoutDirectionRowRev
+			case "col_rev", "col-rev", "column-rev":
+				b = (b &^ LayoutDirectionMask) | LayoutDirectionColRev
 			}
 		}
-	}
-	if !dirSet { // If no explicit direction was found anywhere
-		b |= LayoutDirectionColumn // <<< DEFAULT TO COLUMN
+	} else {
+		b |= LayoutDirectionColumn // Default to Column if no direction specified
 	}
 
 	// Apply Alignment (last one wins)
-	alignSet := false
-	for _, part := range parts {
-		switch part {
-		case "start":			b = (b &^ LayoutAlignmentMask) | LayoutAlignmentStart; alignSet = true
-		case "center", "centre": b = (b &^ LayoutAlignmentMask) | LayoutAlignmentCenter; alignSet = true
-		case "end": 			b = (b &^ LayoutAlignmentMask) | LayoutAlignmentEnd; alignSet = true
-		case "space_between", "space-between": b = (b &^ LayoutAlignmentMask) | LayoutAlignmentSpaceBtn; alignSet = true
+	if hasExplicitAlignment {
+		for _, part := range parts {
+			switch part {
+			case "start":
+				b = (b &^ LayoutAlignmentMask) | LayoutAlignmentStart
+			case "center", "centre":
+				b = (b &^ LayoutAlignmentMask) | LayoutAlignmentCenter
+			case "end":
+				b = (b &^ LayoutAlignmentMask) | LayoutAlignmentEnd
+			case "space_between", "space-between":
+				b = (b &^ LayoutAlignmentMask) | LayoutAlignmentSpaceBtn
+			}
 		}
-	}
-	if !alignSet {
-		b |= LayoutAlignmentStart // Default to start if not specified
+	} else {
+		b |= LayoutAlignmentStart // Default to Start if no alignment specified
 	}
 
-	// Apply Flags
+	// Apply Flags (OR them in)
 	for _, part := range parts {
 		switch part {
-		case "wrap":		b |= LayoutWrapBit
-		case "grow":		b |= LayoutGrowBit
-		case "absolute":	b |= LayoutAbsoluteBit
+		case "wrap":
+			b |= LayoutWrapBit
+		case "grow":
+			b |= LayoutGrowBit
+		case "absolute":
+			b |= LayoutAbsoluteBit
 		}
 	}
 	return b
 }
 
-func (style *StyleEntry) addSourceProperty(key, value string, lineNum int) error {
-	// Check if extends is specified multiple times or after other properties (optional strictness)
-	if key == "extends" {
-		if style.ExtendsStyleName != "" {
-			return fmt.Errorf("style '%s' specifies 'extends' multiple times", style.SourceName)
-		}
-		// Optional: Check if it's the first property
-		// if len(style.SourceProperties) > 0 {
-		// 	 log.Printf("L%d: Warning: 'extends' should ideally be the first property in style '%s'\n", lineNum, style.SourceName)
-		// }
-	} else if style.ExtendsStyleName != "" && len(style.SourceProperties) == 0 {
-		// If extends was set, but this is the first non-extends property
-		// This helps enforce the "extends first" convention slightly
-	}
+// --- Misc Helpers ---
 
-	// Overwrite if key exists? Or just append? Let's append for now.
-	// Resolution pass will handle overrides.
-	if len(style.SourceProperties) >= MaxProperties { // Use MaxProperties as a general limit
-		return fmt.Errorf("L%d: maximum source properties (%d) exceeded for style '%s'", lineNum, MaxProperties, style.SourceName)
+// min helper for integers
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-	prop := SourceProperty{Key: key, ValueStr: value, LineNum: lineNum}
-	style.SourceProperties = append(style.SourceProperties, prop)
-	return nil
+	return b
 }

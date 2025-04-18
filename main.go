@@ -64,14 +64,6 @@ func main() {
 	if err := state.resolveComponentsAndProperties(); err != nil {
 		log.Fatalf("Failed: Expansion/Resolution - %v\n", err)
 	}
-	// Note: Element properties are finalized AFTER this pass.
-
-	// --- Pass 1.7: Adjust Layout for Position (Placeholder/Future) ---
-	log.Println("Pass 1.7: Adjusting layout (position handling)...")
-	if err := state.adjustLayoutForPosition(); err != nil {
-		log.Fatalf("Failed: Layout Adjustment - %v\n", err)
-	}
-	// Note: This pass is currently a no-op in the provided code.
 
 	// --- Pass 2: Calculate Offsets and Final Sizes ---
 	log.Println("Pass 2: Calculating final offsets and sizes...")
