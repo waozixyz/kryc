@@ -123,6 +123,7 @@ const (
 	LayoutAlignmentSpaceBtn uint8 = (3 << 2)
 	LayoutWrapBit           uint8 = (1 << 4)
 	LayoutGrowBit           uint8 = (1 << 5)
+
 	LayoutAbsoluteBit       uint8 = (1 << 6)
 )
 
