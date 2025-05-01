@@ -322,6 +322,18 @@ type CompilerState struct {
 
 type BlockContextType int
 
+type EdgeInsetParseState struct {
+	ParentKey   string  // "padding" or "margin"
+	Top         *string // Store as string pointers to differentiate not-set from "0"
+	Right       *string
+	Bottom      *string
+	Left        *string
+	ParentCtx   interface{} // Pointer to the parent *Element or *StyleEntry
+	ParentCtxType BlockContextType // Type of the parent (CtxElement or CtxStyle)
+	Indent      int         // Indentation level where this block started
+	StartLine   int         // Line number where the block started
+}
+
 const (
 	CtxNone BlockContextType = iota
 	CtxElement
@@ -329,7 +341,9 @@ const (
 	CtxComponentDef
 	CtxProperties       // Inside Define -> Properties { }
 	CtxComponentDefBody // Inside Define -> after RootType { }
+	CtxEdgeInsetProperty
 )
+
 
 type BlockStackEntry struct {
 	Indent  int

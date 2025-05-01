@@ -64,7 +64,48 @@ func (state *CompilerState) parseKrySource(sourceBuffer string) error {
 			if len(blockStack) == 0 {
 				return fmt.Errorf("L%d: mismatched '}'", currentLineNum)
 			}
-			blockStack = blockStack[:len(blockStack)-1] // Pop the stack
+
+
+            poppedEntry := blockStack[len(blockStack)-1]
+            blockStack = blockStack[:len(blockStack)-1] // Pop the stack
+
+            // Check if we just closed an EdgeInset block
+            if poppedEntry.Type == CtxEdgeInsetProperty {
+                edgeState, ok := poppedEntry.Context.(*EdgeInsetParseState)
+                if !ok || edgeState == nil {
+                     return fmt.Errorf("L%d: internal error: invalid context found when closing edge inset block", currentLineNum)
+                }
+
+                // Get parent element/style from the state we stored
+                var addPropErr error
+                baseKey := edgeState.ParentKey // "padding" or "margin"
+
+                // Add corresponding long-form source properties to the PARENT
+                if edgeState.ParentCtxType == CtxElement {
+                    parentEl := edgeState.ParentCtx.(*Element)
+                    if edgeState.Top != nil { addPropErr = parentEl.addSourceProperty(baseKey+"_top", *edgeState.Top, edgeState.StartLine); if addPropErr != nil { break } }
+                    if edgeState.Right != nil { addPropErr = parentEl.addSourceProperty(baseKey+"_right", *edgeState.Right, edgeState.StartLine); if addPropErr != nil { break } }
+                    if edgeState.Bottom != nil { addPropErr = parentEl.addSourceProperty(baseKey+"_bottom", *edgeState.Bottom, edgeState.StartLine); if addPropErr != nil { break } }
+                    if edgeState.Left != nil { addPropErr = parentEl.addSourceProperty(baseKey+"_left", *edgeState.Left, edgeState.StartLine); if addPropErr != nil { break } }
+                } else if edgeState.ParentCtxType == CtxStyle {
+                     parentStyle := edgeState.ParentCtx.(*StyleEntry)
+                    if edgeState.Top != nil { addPropErr = parentStyle.addSourceProperty(baseKey+"_top", *edgeState.Top, edgeState.StartLine); if addPropErr != nil { break } }
+                    if edgeState.Right != nil { addPropErr = parentStyle.addSourceProperty(baseKey+"_right", *edgeState.Right, edgeState.StartLine); if addPropErr != nil { break } }
+                    if edgeState.Bottom != nil { addPropErr = parentStyle.addSourceProperty(baseKey+"_bottom", *edgeState.Bottom, edgeState.StartLine); if addPropErr != nil { break } }
+                    if edgeState.Left != nil { addPropErr = parentStyle.addSourceProperty(baseKey+"_left", *edgeState.Left, edgeState.StartLine); if addPropErr != nil { break } }
+                } else {
+                     // This shouldn't happen based on where we push CtxEdgeInsetProperty
+                     return fmt.Errorf("L%d: internal error: unexpected parent context type (%v) for edge inset block", edgeState.StartLine, edgeState.ParentCtxType)
+                }
+
+                if addPropErr != nil {
+                    // Return error if adding the converted source property failed (e.g., max properties)
+                     return fmt.Errorf("L%d: error adding converted edge inset property: %w", edgeState.StartLine, addPropErr)
+                }
+
+                log.Printf("   Parsed Edge Inset Block for '%s' (L%d)\n", edgeState.ParentKey, edgeState.StartLine)
+            }
+
 			continue
 		}
 
@@ -193,6 +234,42 @@ func (state *CompilerState) parseKrySource(sourceBuffer string) error {
 				blockStack = append(blockStack, BlockStackEntry{indent, currentElement, CtxElement}); continue // Handled element start
 			}
 
+
+			parts := strings.SplitN(blockContent, ":", 2)
+			if len(parts) == 2 {
+				key := strings.TrimSpace(parts[0])
+				val := strings.TrimSpace(parts[1]) // Should be empty if line ends in '{'
+
+				// Check if the key is 'padding' or 'margin' and the value part is empty
+				if (key == "padding" || key == "margin") && val == "" {
+					// Found "padding: {" or "margin: {"
+
+					// Check if the current context allows starting this block
+					if currentCtxType != CtxElement && currentCtxType != CtxStyle && currentCtxType != CtxComponentDefBody {
+						 // Added CtxComponentDefBody as valid parent
+						 return fmt.Errorf("L%d: '%s: {' block must be inside an Element, Style, or Define Body", currentLineNum, key)
+					}
+					if len(blockStack) >= MaxBlockDepth {
+						 return fmt.Errorf("L%d: max block depth exceeded starting '%s: {'", currentLineNum, key)
+					}
+
+                    // Create the state object for parsing edge insets
+                    edgeState := &EdgeInsetParseState{
+                        ParentKey:     key,           // Store "padding" or "margin"
+                        ParentCtx:     currentContext,// Store reference to the parent (*Element, *StyleEntry, or *ComponentDefinition)
+                        ParentCtxType: currentCtxType, // Store the type of the parent context
+                        Indent:        indent,        // Store block's indent level
+                        StartLine:     currentLineNum, // Store starting line number
+						// Top, Right, Bottom, Left start as nil
+                    }
+
+                    // Push the new context onto the stack
+					blockStack = append(blockStack, BlockStackEntry{Indent: indent, Context: edgeState, Type: CtxEdgeInsetProperty})
+					log.Printf("   Start Edge Inset Block for '%s'\n", key)
+					continue // Handled padding/margin block start, move to next line
+				}
+			}
+
 			// If block opened but wasn't Define, Style, Properties, or Element
 			return fmt.Errorf("L%d: invalid block start syntax: '%s'", currentLineNum, trimmed) // Use trimmed which includes '{' here
 
@@ -231,6 +308,75 @@ func (state *CompilerState) parseKrySource(sourceBuffer string) error {
 				pd := ComponentPropertyDef{Name: key, DefaultValueStr: propDefault}; switch propType { case "String": pd.ValueTypeHint = ValTypeString; case "Int": pd.ValueTypeHint = ValTypeShort; case "Bool": pd.ValueTypeHint = ValTypeByte; case "Color": pd.ValueTypeHint = ValTypeColor; case "StyleID": pd.ValueTypeHint = ValTypeStyleID; case "Resource": pd.ValueTypeHint = ValTypeResource; case "Float": pd.ValueTypeHint = ValTypeFloat; default: log.Printf("L%d: Warn: Unknown prop type hint '%s' for '%s'", currentLineNum, propType, key); pd.ValueTypeHint = ValTypeCustom }; parentComponentDef.Properties = append(parentComponentDef.Properties, pd)
 
 
+            case CtxEdgeInsetProperty:
+                // We are inside a "padding: {" or "margin: {" block.
+                // We expect lines like "top: 10", "right: 5", etc.
+
+                // First, check if the line even looks like a property ('key: value').
+                if !isPropertyLike {
+                     // If it doesn't look like 'key: value', it might be a comment
+                     // or just an empty/invalid line within the block.
+                     // We ignore comments and empty lines silently.
+                     // Log a warning for other invalid syntax inside the block.
+                     if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+						// Get parent key for better error message, default if context is weird
+						parentKey := "edge inset"
+						if edgeState, ok := contextObject.(*EdgeInsetParseState); ok && edgeState != nil {
+							parentKey = edgeState.ParentKey
+						}
+                        log.Printf("L%d: Warning: Invalid syntax inside '%s: {}' block (expected 'key: value'): '%s'. Line ignored.", currentLineNum, parentKey, trimmed)
+                     }
+                     // Skip processing this line further.
+                     continue // Move to the next line in the source file.
+                }
+
+                // If it looks like 'key: value', extract the key and value parts.
+                // keyPart and parts are already defined earlier in the loop.
+                key := keyPart                       // e.g., "top", "right"
+                valueStr := strings.TrimSpace(parts[1]) // e.g., "10", "\"auto\"" - Keep quotes for now
+
+                // Get the current edge inset state object from the context stack.
+                edgeState, ok := contextObject.(*EdgeInsetParseState)
+                if !ok || edgeState == nil {
+					// This indicates an internal compiler error - the context should be correct here.
+					return fmt.Errorf("L%d: Internal error: Invalid context object for CtxEdgeInsetProperty", currentLineNum)
+				}
+
+                // Store the raw value string (including quotes if any) based on the key.
+                // We use pointers in EdgeInsetParseState, so store the address of the string.
+                // Note: We don't parse the numeric value here; we store the raw string.
+                // The conversion to long-form SourceProperty happens when '}' is found.
+                switch key {
+                case "top":
+                     // Check if 'top' was already set in this block.
+                     if edgeState.Top != nil {
+                         log.Printf("L%d: Warning: duplicate 'top' key in '%s' block. Overwriting previous value.", currentLineNum, edgeState.ParentKey)
+                     }
+                     // Store the address of the value string.
+                     edgeState.Top = &valueStr
+                case "right":
+                     if edgeState.Right != nil {
+                         log.Printf("L%d: Warning: duplicate 'right' key in '%s' block. Overwriting previous value.", currentLineNum, edgeState.ParentKey)
+                     }
+                     edgeState.Right = &valueStr
+                case "bottom":
+                     if edgeState.Bottom != nil {
+                         log.Printf("L%d: Warning: duplicate 'bottom' key in '%s' block. Overwriting previous value.", currentLineNum, edgeState.ParentKey)
+                     }
+                     edgeState.Bottom = &valueStr
+                case "left":
+                     if edgeState.Left != nil {
+                         log.Printf("L%d: Warning: duplicate 'left' key in '%s' block. Overwriting previous value.", currentLineNum, edgeState.ParentKey)
+                     }
+                     edgeState.Left = &valueStr
+                default:
+                    // The key is not one of the expected edge inset keys (top, right, bottom, left).
+                    log.Printf("L%d: Warning: Unexpected key '%s' found inside '%s: {}' block. Property ignored.", currentLineNum, key, edgeState.ParentKey)
+                    // We simply ignore unexpected keys within this block.
+                }
+                // Finished processing this line within the edge inset block.
+                continue // Move to the next line.
+				
 			case CtxStyle: // Inside style "name" { }
 				if !isPropertyLike { return fmt.Errorf("L%d: invalid property syntax inside Style block (expected 'key: value'): '%s'", currentLineNum, trimmed) }
 				key := keyPart; valueStrRaw := strings.TrimSpace(parts[1]) // Keep raw value for addSourceProperty if needed
