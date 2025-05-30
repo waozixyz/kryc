@@ -107,7 +107,6 @@ func readAndProcessIncludes(filePath string, depth int, totalLinesProcessed *int
 	return resultBuffer.String(), nil
 }
 
-
 // preprocessIncludes is the entry point for include processing.
 func preprocessIncludes(mainFilePath string) (string, int, error) {
 	totalLines := 0

@@ -4,9 +4,10 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"strings"
-	"io"
+	"unicode"
 )
 
 // --- String/Value Cleaning ---
@@ -19,41 +20,57 @@ func trimQuotes(s string) string {
 	return s
 }
 
-// cleanAndQuoteValue removes comments, trims space, and returns both the fully cleaned value
-// (for parsing numbers, bools etc.) and a version with only outer quotes trimmed (for string table lookups).
-func cleanAndQuoteValue(valStr string) (cleanVal, quotedVal string) {
-	valuePart := valStr
-	// Trim initial whitespace before checking for comments
-	trimmedValueBeforeCommentCheck := strings.TrimSpace(valuePart)
+func cleanAndQuoteValue(valStr string) (cleanedString string, wasQuoted bool) {
+	trimmed := strings.TrimSpace(valStr) // Initial trim
 
+	// Check for full-line comment first
+	if strings.HasPrefix(trimmed, "#") {
+		return "", false // Treat as empty if line starts with #
+	}
+
+	valuePart := trimmed // Work with the trimmed version
 	commentIndex := -1
 	inQuotes := false
-	// Scan for '#' that marks a comment, ignoring # inside quotes or at the start (hex color)
-	for i, r := range trimmedValueBeforeCommentCheck {
+
+	// Find the first '#' that signifies a comment (not inside quotes)
+	// *after* the first character (to allow # for hex colors)
+	for i, r := range valuePart {
 		if r == '"' {
-			// Basic quote toggling, doesn't handle escaped quotes
 			inQuotes = !inQuotes
 		}
-		// '#' is a comment if not inside quotes and not the very first character
-		if r == '#' && !inQuotes && i > 0 {
+		if r == '#' && !inQuotes && i > 0 { // Only consider '#' after index 0
 			commentIndex = i
 			break
 		}
 	}
 
-	// Slice the string if a valid comment marker was found
-	if commentIndex > 0 {
-		valuePart = trimmedValueBeforeCommentCheck[:commentIndex]
-	} else {
-		// Use the already trimmed string if no comment found (or comment was invalid)
-		valuePart = trimmedValueBeforeCommentCheck
+	// If a comment was found, slice the string up to the comment start
+	if commentIndex != -1 {
+		valuePart = valuePart[:commentIndex]
 	}
 
-	// Final trim after potentially removing the comment part
-	cleanVal = strings.TrimSpace(valuePart)
-	// Separately trim just the outer quotes from the cleaned value for string lookup
-	quotedVal = trimQuotes(cleanVal)
-	return
+	// Trim trailing space AGAIN after potentially removing the comment
+	finalTrimmed := strings.TrimRightFunc(valuePart, unicode.IsSpace)
+
+	// Check if the result was originally quoted
+	wasQuoted = len(finalTrimmed) >= 2 && finalTrimmed[0] == '"' && finalTrimmed[len(finalTrimmed)-1] == '"'
+
+	// Remove outer quotes if they existed to get the final cleaned string
+	if wasQuoted {
+		cleanedString = finalTrimmed[1 : len(finalTrimmed)-1]
+	} else {
+		cleanedString = finalTrimmed
+	}
+
+	// Special check: If the result STILL starts with # but has internal spaces, it's likely bad
+	// (e.g., "#FF00FF comment_without_leading_hash") - Treat as invalid to avoid issues.
+	// This is a heuristic.
+	if strings.HasPrefix(cleanedString, "#") && strings.Contains(cleanedString, " ") {
+		log.Printf("Warning: Potential invalid value detected after cleaning '%s', resulting in '%s'. Treating as empty.", valStr, cleanedString)
+		return "", wasQuoted // Return empty to cause parsing error downstream if needed
+	}
+
+	return // Use named return values
 }
 
 // --- Binary Writing Helpers ---
@@ -75,12 +92,10 @@ func writeUint32(w io.Writer, value uint32) error {
 
 // parseColor converts "#RRGGBBAA" or "#RGB" etc. to [4]uint8 {R, G, B, A}
 func parseColor(valueStr string) ([4]uint8, bool) {
-	c := [4]uint8{0, 0, 0, 255} // Default alpha to 255
+	c := [4]uint8{0, 0, 0, 255}             // Default alpha to 255
 	cleanVal := strings.TrimSpace(valueStr) // Trim space first
 
 	if !strings.HasPrefix(cleanVal, "#") {
-		// Allow named colors in the future? For now, require #
-		// log.Printf("Warning: Invalid color format (missing #): '%s'\n", valueStr)
 		return c, false
 	}
 	hexStr := cleanVal[1:]
@@ -118,19 +133,20 @@ func parseColor(valueStr string) ([4]uint8, bool) {
 	return c, false // Return default black on error
 }
 
+// guessResourceType provides a basic guess for resource type based on common keywords in the property key.
 func guessResourceType(key string) uint8 {
 	lowerKey := strings.ToLower(key)
 	if strings.Contains(lowerKey, "image") || strings.Contains(lowerKey, "icon") || strings.Contains(lowerKey, "sprite") || strings.Contains(lowerKey, "texture") || strings.Contains(lowerKey, "background") || strings.Contains(lowerKey, "logo") || strings.Contains(lowerKey, "avatar") {
 		return ResTypeImage
 	}
 	if strings.Contains(lowerKey, "font") {
-		return ResTypeFont // Assuming ResTypeFont is defined in constants.go
+		return ResTypeFont
 	}
 	if strings.Contains(lowerKey, "sound") || strings.Contains(lowerKey, "audio") || strings.Contains(lowerKey, "music") {
-		return ResTypeSound // Assuming ResTypeSound is defined in constants.go
+		return ResTypeSound
 	}
-	// Add other guesses if needed based on common key names
-	// Default guess if no strong hints found - Image is often a safe default.
+	// Default guess if no strong hints found
+	log.Printf("Debug: Could not guess resource type for key '%s', defaulting to Image.", key)
 	return ResTypeImage
 }
 
@@ -174,7 +190,7 @@ func parseLayoutString(layoutStr string) uint8 {
 	hasExplicitDirection := false
 	hasExplicitAlignment := false
 
-	// Pass 1: Check for explicit direction and alignment
+	// Determine if explicit direction/alignment are set
 	for _, part := range parts {
 		switch part {
 		case "row", "col", "column", "row_rev", "row-rev", "col_rev", "col-rev", "column-rev":
@@ -184,43 +200,41 @@ func parseLayoutString(layoutStr string) uint8 {
 		}
 	}
 
-	// Apply Direction (last one wins if multiple specified)
-	if hasExplicitDirection {
-		for _, part := range parts {
-			switch part {
-			case "row":
-				b = (b &^ LayoutDirectionMask) | LayoutDirectionRow
-			case "col", "column":
-				b = (b &^ LayoutDirectionMask) | LayoutDirectionColumn
-			case "row_rev", "row-rev":
-				b = (b &^ LayoutDirectionMask) | LayoutDirectionRowRev
-			case "col_rev", "col-rev", "column-rev":
-				b = (b &^ LayoutDirectionMask) | LayoutDirectionColRev
-			}
+	// Apply Direction (default to Column)
+	if !hasExplicitDirection {
+		b |= LayoutDirectionColumn
+	}
+	for _, part := range parts { // Last one specified wins
+		switch part {
+		case "row":
+			b = (b &^ LayoutDirectionMask) | LayoutDirectionRow
+		case "col", "column":
+			b = (b &^ LayoutDirectionMask) | LayoutDirectionColumn
+		case "row_rev", "row-rev":
+			b = (b &^ LayoutDirectionMask) | LayoutDirectionRowRev
+		case "col_rev", "col-rev", "column-rev":
+			b = (b &^ LayoutDirectionMask) | LayoutDirectionColRev
 		}
-	} else {
-		b |= LayoutDirectionColumn // Default to Column if no direction specified
 	}
 
-	// Apply Alignment (last one wins)
-	if hasExplicitAlignment {
-		for _, part := range parts {
-			switch part {
-			case "start":
-				b = (b &^ LayoutAlignmentMask) | LayoutAlignmentStart
-			case "center", "centre":
-				b = (b &^ LayoutAlignmentMask) | LayoutAlignmentCenter
-			case "end":
-				b = (b &^ LayoutAlignmentMask) | LayoutAlignmentEnd
-			case "space_between", "space-between":
-				b = (b &^ LayoutAlignmentMask) | LayoutAlignmentSpaceBtn
-			}
+	// Apply Alignment (default to Start)
+	if !hasExplicitAlignment {
+		b |= LayoutAlignmentStart
+	}
+	for _, part := range parts { // Last one specified wins
+		switch part {
+		case "start":
+			b = (b &^ LayoutAlignmentMask) | LayoutAlignmentStart
+		case "center", "centre":
+			b = (b &^ LayoutAlignmentMask) | LayoutAlignmentCenter
+		case "end":
+			b = (b &^ LayoutAlignmentMask) | LayoutAlignmentEnd
+		case "space_between", "space-between":
+			b = (b &^ LayoutAlignmentMask) | LayoutAlignmentSpaceBtn
 		}
-	} else {
-		b |= LayoutAlignmentStart // Default to Start if no alignment specified
 	}
 
-	// Apply Flags (OR them in)
+	// Apply Flags
 	for _, part := range parts {
 		switch part {
 		case "wrap":

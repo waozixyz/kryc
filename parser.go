@@ -10,9 +10,6 @@ import (
 	"unicode"
 )
 
-
-
-
 // parseKrySource parses the preprocessed KRY source string.
 func (state *CompilerState) parseKrySource(sourceBuffer string) error {
 	scanner := bufio.NewScanner(strings.NewReader(sourceBuffer))
@@ -34,25 +31,44 @@ func (state *CompilerState) parseKrySource(sourceBuffer string) error {
 		line := scanner.Text()
 
 		// --- Prepare Line ---
-		originalLine := line // Keep original for potential error messages if needed
+		originalLine := line
 		trimmed := line
 		indent := 0
-		for _, r := range trimmed { if r == ' ' { indent++ } else if r == '\t' { indent += 4 } else { break } }
-		trimmed = strings.TrimLeftFunc(trimmed, unicode.IsSpace) // Remove leading whitespace only for processing
-
-		// Handle comments starting at the beginning of the effective line
-		if strings.HasPrefix(trimmed, "#") {
-			trimmed = "" // Treat the whole line as a comment if # is first non-space char
+		for _, r := range trimmed {
+			if r == ' ' {
+				indent++
+			} else if r == '\t' {
+				indent += 4
+			} else {
+				break
+			}
 		}
-		// Trim trailing whitespace *after* checking for full-line comment
+		trimmed = strings.TrimLeftFunc(trimmed, unicode.IsSpace)
+
+		if strings.HasPrefix(trimmed, "#") {
+			trimmed = ""
+		} else {
+			commentIndex := -1
+			inQuotes := false
+			for i, r := range trimmed {
+				if r == '"' {
+					inQuotes = !inQuotes
+				}
+				if r == '#' && !inQuotes {
+					commentIndex = i
+					break
+				}
+			}
+			if commentIndex != -1 {
+				trimmed = trimmed[:commentIndex]
+			}
+		}
 		trimmed = strings.TrimRightFunc(trimmed, unicode.IsSpace)
 
-		// Skip empty lines (or lines that became empty after comment removal)
 		if trimmed == "" {
 			continue
 		}
 
-		// Basic line length check
 		if len(originalLine) > MaxLineLength {
 			log.Printf("L%d: Warning: Line exceeds MaxLineLength (%d)\n", currentLineNum, MaxLineLength)
 		}
@@ -65,406 +81,655 @@ func (state *CompilerState) parseKrySource(sourceBuffer string) error {
 				return fmt.Errorf("L%d: mismatched '}'", currentLineNum)
 			}
 
+			poppedEntry := blockStack[len(blockStack)-1]
+			blockStack = blockStack[:len(blockStack)-1]
 
-            poppedEntry := blockStack[len(blockStack)-1]
-            blockStack = blockStack[:len(blockStack)-1] // Pop the stack
+			if poppedEntry.Type == CtxEdgeInsetProperty {
+				edgeState, ok := poppedEntry.Context.(*EdgeInsetParseState)
+				if !ok || edgeState == nil {
+					return fmt.Errorf("L%d: internal error: invalid context found when closing edge inset block", currentLineNum)
+				}
 
-            // Check if we just closed an EdgeInset block
-            if poppedEntry.Type == CtxEdgeInsetProperty {
-                edgeState, ok := poppedEntry.Context.(*EdgeInsetParseState)
-                if !ok || edgeState == nil {
-                     return fmt.Errorf("L%d: internal error: invalid context found when closing edge inset block", currentLineNum)
-                }
+				var addPropErr error
+				baseKey := edgeState.ParentKey
 
-                // Get parent element/style from the state we stored
-                var addPropErr error
-                baseKey := edgeState.ParentKey // "padding" or "margin"
+				if edgeState.ParentCtxType == CtxElement {
+					if parentEl, ok := edgeState.ParentCtx.(*Element); ok && parentEl != nil {
+						if edgeState.Top != nil {
+							addPropErr = parentEl.addSourceProperty(baseKey+"_top", *edgeState.Top, edgeState.StartLine)
+							if addPropErr != nil {
+								break
+							}
+						}
+						if edgeState.Right != nil {
+							addPropErr = parentEl.addSourceProperty(baseKey+"_right", *edgeState.Right, edgeState.StartLine)
+							if addPropErr != nil {
+								break
+							}
+						}
+						if edgeState.Bottom != nil {
+							addPropErr = parentEl.addSourceProperty(baseKey+"_bottom", *edgeState.Bottom, edgeState.StartLine)
+							if addPropErr != nil {
+								break
+							}
+						}
+						if edgeState.Left != nil {
+							addPropErr = parentEl.addSourceProperty(baseKey+"_left", *edgeState.Left, edgeState.StartLine)
+							if addPropErr != nil {
+								break
+							}
+						}
+					} else {
+						log.Printf("L%d: Warning: Invalid parent element context found when closing edge inset block for element.", currentLineNum)
+					}
+				} else if edgeState.ParentCtxType == CtxStyle {
+					if parentStyle, ok := edgeState.ParentCtx.(*StyleEntry); ok && parentStyle != nil {
+						if edgeState.Top != nil {
+							addPropErr = parentStyle.addSourceProperty(baseKey+"_top", *edgeState.Top, edgeState.StartLine)
+							if addPropErr != nil {
+								break
+							}
+						}
+						if edgeState.Right != nil {
+							addPropErr = parentStyle.addSourceProperty(baseKey+"_right", *edgeState.Right, edgeState.StartLine)
+							if addPropErr != nil {
+								break
+							}
+						}
+						if edgeState.Bottom != nil {
+							addPropErr = parentStyle.addSourceProperty(baseKey+"_bottom", *edgeState.Bottom, edgeState.StartLine)
+							if addPropErr != nil {
+								break
+							}
+						}
+						if edgeState.Left != nil {
+							addPropErr = parentStyle.addSourceProperty(baseKey+"_left", *edgeState.Left, edgeState.StartLine)
+							if addPropErr != nil {
+								break
+							}
+						}
+					} else {
+						log.Printf("L%d: Warning: Invalid parent style context found when closing edge inset block for style.", currentLineNum)
+					}
+				} else {
+					return fmt.Errorf("L%d: internal error: unexpected parent context type (%v) for edge inset block", edgeState.StartLine, edgeState.ParentCtxType)
+				}
 
-                // Add corresponding long-form source properties to the PARENT
-                if edgeState.ParentCtxType == CtxElement {
-                    parentEl := edgeState.ParentCtx.(*Element)
-                    if edgeState.Top != nil { addPropErr = parentEl.addSourceProperty(baseKey+"_top", *edgeState.Top, edgeState.StartLine); if addPropErr != nil { break } }
-                    if edgeState.Right != nil { addPropErr = parentEl.addSourceProperty(baseKey+"_right", *edgeState.Right, edgeState.StartLine); if addPropErr != nil { break } }
-                    if edgeState.Bottom != nil { addPropErr = parentEl.addSourceProperty(baseKey+"_bottom", *edgeState.Bottom, edgeState.StartLine); if addPropErr != nil { break } }
-                    if edgeState.Left != nil { addPropErr = parentEl.addSourceProperty(baseKey+"_left", *edgeState.Left, edgeState.StartLine); if addPropErr != nil { break } }
-                } else if edgeState.ParentCtxType == CtxStyle {
-                     parentStyle := edgeState.ParentCtx.(*StyleEntry)
-                    if edgeState.Top != nil { addPropErr = parentStyle.addSourceProperty(baseKey+"_top", *edgeState.Top, edgeState.StartLine); if addPropErr != nil { break } }
-                    if edgeState.Right != nil { addPropErr = parentStyle.addSourceProperty(baseKey+"_right", *edgeState.Right, edgeState.StartLine); if addPropErr != nil { break } }
-                    if edgeState.Bottom != nil { addPropErr = parentStyle.addSourceProperty(baseKey+"_bottom", *edgeState.Bottom, edgeState.StartLine); if addPropErr != nil { break } }
-                    if edgeState.Left != nil { addPropErr = parentStyle.addSourceProperty(baseKey+"_left", *edgeState.Left, edgeState.StartLine); if addPropErr != nil { break } }
-                } else {
-                     // This shouldn't happen based on where we push CtxEdgeInsetProperty
-                     return fmt.Errorf("L%d: internal error: unexpected parent context type (%v) for edge inset block", edgeState.StartLine, edgeState.ParentCtxType)
-                }
-
-                if addPropErr != nil {
-                    // Return error if adding the converted source property failed (e.g., max properties)
-                     return fmt.Errorf("L%d: error adding converted edge inset property: %w", edgeState.StartLine, addPropErr)
-                }
-
-                log.Printf("   Parsed Edge Inset Block for '%s' (L%d)\n", edgeState.ParentKey, edgeState.StartLine)
-            }
-
+				if addPropErr != nil {
+					return fmt.Errorf("L%d: error adding converted edge inset property for '%s': %w", edgeState.StartLine, baseKey, addPropErr)
+				}
+				if addPropErr == nil {
+					// log.Printf("   Parsed Edge Inset Block for '%s' (L%d)\n", edgeState.ParentKey, edgeState.StartLine)
+				}
+			}
 			continue
 		}
 
 		// --- 2. Check for Block Start ---
-		// Check if '{' is the last non-whitespace character on the line
 		blockOpened := strings.HasSuffix(trimmed, "{")
-		blockContent := trimmed // Content before potential '{'
+		blockContent := trimmed
 		if blockOpened {
-			// Find the '{' and take content before it, trimming space
 			braceIndex := strings.LastIndex(trimmed, "{")
 			if braceIndex != -1 {
 				blockContent = strings.TrimSpace(trimmed[:braceIndex])
 			} else {
-				// Fallback shouldn't be needed with HasSuffix but handle defensively
-				blockContent = strings.TrimSpace(trimmed[:len(trimmed)-1])
+				blockContent = strings.TrimSpace(trimmed[:len(trimmed)-1]) // Should not happen if HasSuffix is true
 			}
 		}
 
-		// Identify potential block types based on the content *before* '{'
 		isDefine := strings.HasPrefix(blockContent, "Define ") && blockOpened
 		isStyle := strings.HasPrefix(blockContent, "style ") && blockOpened
 		isProperties := blockContent == "Properties" && blockOpened
-		// Element check: Starts with an uppercase letter convention?
-		isElement := len(blockContent) > 0 && unicode.IsUpper(rune(blockContent[0])) && blockOpened
+		firstWordIsUpper := false
+		fields := strings.Fields(blockContent)
+		if len(fields) > 0 && len(fields[0]) > 0 {
+			firstWordIsUpper = unicode.IsUpper(rune(fields[0][0]))
+		}
+		isElement := firstWordIsUpper && blockOpened
 
 		// --- 3. Process Potential Block Start Lines ---
 		if blockOpened {
 			// --- 3a. Define Block ---
 			if isDefine {
-				if currentCtxType != CtxNone { return fmt.Errorf("L%d: 'Define' must be at the top level", currentLineNum) }
-				parts := strings.Fields(blockContent); if len(parts) == 2 {
-					name := parts[1]; if state.findComponentDef(name) != nil { return fmt.Errorf("L%d: component '%s' redefined", currentLineNum, name) }
-					if len(state.ComponentDefs) >= MaxComponentDefs { return fmt.Errorf("L%d: maximum component definitions (%d) exceeded", currentLineNum, MaxComponentDefs) }
-					def := ComponentDefinition{ Name: name, DefinitionStartLine: currentLineNum, Properties: make([]ComponentPropertyDef, 0, 4), DefinitionRootProperties: make([]SourceProperty, 0, 4), }
+				if currentCtxType != CtxNone {
+					return fmt.Errorf("L%d: 'Define' must be at the top level", currentLineNum)
+				}
+				parts := strings.Fields(blockContent)
+				if len(parts) == 2 {
+					name := parts[1]
+					if state.findComponentDef(name) != nil {
+						return fmt.Errorf("L%d: component '%s' redefined", currentLineNum, name)
+					}
+					if len(state.ComponentDefs) >= MaxComponentDefs {
+						return fmt.Errorf("L%d: maximum component definitions (%d) exceeded", currentLineNum, MaxComponentDefs)
+					}
+					def := ComponentDefinition{
+						Name:                       name,
+						DefinitionStartLine:        currentLineNum,
+						Properties:                 make([]ComponentPropertyDef, 0, 4),
+						DefinitionRootElementIndex: -1, // Initialize
+					}
 					state.ComponentDefs = append(state.ComponentDefs, def)
+					state.HeaderFlags |= FlagHasComponentDefs // Set the flag
+
 					currentComponentDef := &state.ComponentDefs[len(state.ComponentDefs)-1]
-					if len(blockStack) >= MaxBlockDepth { return fmt.Errorf("L%d: max block depth exceeded", currentLineNum) }
-					blockStack = append(blockStack, BlockStackEntry{indent, currentComponentDef, CtxComponentDef}); log.Printf("   Def: %s\n", name)
-				} else { return fmt.Errorf("L%d: invalid Define syntax: '%s'", currentLineNum, blockContent) }
-				continue // Handled Define
+					if len(blockStack) >= MaxBlockDepth {
+						return fmt.Errorf("L%d: max block depth exceeded", currentLineNum)
+					}
+					blockStack = append(blockStack, BlockStackEntry{indent, currentComponentDef, CtxComponentDef})
+					log.Printf("   Def: %s\n", name)
+				} else {
+					return fmt.Errorf("L%d: invalid Define syntax: '%s'", currentLineNum, blockContent)
+				}
+				continue
 			}
 
 			// --- 3b. Style Block ---
 			if isStyle {
-				if currentCtxType != CtxNone { return fmt.Errorf("L%d: 'style' must be at the top level", currentLineNum) }
-				parts := strings.SplitN(blockContent, "\"", 3); if len(parts) == 3 && strings.TrimSpace(parts[0]) == "style" && strings.TrimSpace(parts[2]) == "" {
-					name := parts[1]; if name == "" { return fmt.Errorf("L%d: style name cannot be empty", currentLineNum) }
-					if state.findStyleByName(name) != nil { return fmt.Errorf("L%d: style '%s' redefined", currentLineNum, name) }
-					if len(state.Styles) >= MaxStyles { return fmt.Errorf("L%d: maximum styles (%d) exceeded", currentLineNum, MaxStyles) }
-					styleID := uint8(len(state.Styles) + 1); nameIdx, err := state.addString(name); if err != nil { return fmt.Errorf("L%d: failed adding style name '%s': %w", currentLineNum, name, err) }
-					styleEntry := StyleEntry{ ID: styleID, SourceName: name, NameIndex: nameIdx, Properties: make([]KrbProperty, 0, 4), SourceProperties: make([]SourceProperty, 0, 8), CalculatedSize: 3, }
+				if currentCtxType != CtxNone {
+					return fmt.Errorf("L%d: 'style' must be at the top level (Current context: %v)", currentLineNum, currentCtxType)
+				}
+				parts := strings.SplitN(blockContent, "\"", 3)
+				if len(parts) == 3 && strings.TrimSpace(parts[0]) == "style" && strings.TrimSpace(parts[2]) == "" {
+					name := parts[1]
+					if name == "" {
+						return fmt.Errorf("L%d: style name cannot be empty", currentLineNum)
+					}
+					if state.findStyleByName(name) != nil {
+						return fmt.Errorf("L%d: style '%s' redefined", currentLineNum, name)
+					}
+					if len(state.Styles) >= MaxStyles {
+						return fmt.Errorf("L%d: maximum styles (%d) exceeded", currentLineNum, MaxStyles)
+					}
+
+					styleID := uint8(len(state.Styles) + 1)
+					nameIdx, err := state.addString(name)
+					if err != nil {
+						return fmt.Errorf("L%d: failed adding style name '%s': %w", currentLineNum, name, err)
+					}
+
+					styleEntry := StyleEntry{
+						ID: styleID, SourceName: name, NameIndex: nameIdx,
+						Properties: make([]KrbProperty, 0, 4), SourceProperties: make([]SourceProperty, 0, 8),
+						CalculatedSize: 3, ExtendsStyleNames: make([]string, 0, 1),
+					}
 					state.Styles = append(state.Styles, styleEntry)
 					currentStyle := &state.Styles[len(state.Styles)-1]
-					if len(blockStack) >= MaxBlockDepth { return fmt.Errorf("L%d: max block depth exceeded", currentLineNum) }
-					blockStack = append(blockStack, BlockStackEntry{indent, currentStyle, CtxStyle}); state.HeaderFlags |= FlagHasStyles
-				} else { return fmt.Errorf("L%d: invalid style syntax: '%s', use 'style \"name\" {'", currentLineNum, blockContent) }
-				continue // Handled Style
+					if len(blockStack) >= MaxBlockDepth {
+						return fmt.Errorf("L%d: max block depth exceeded", currentLineNum)
+					}
+					blockStack = append(blockStack, BlockStackEntry{indent, currentStyle, CtxStyle})
+					state.HeaderFlags |= FlagHasStyles
+				} else {
+					return fmt.Errorf("L%d: invalid style syntax: '%s', use 'style \"name\" {'", currentLineNum, blockContent)
+				}
+				continue
 			}
 
 			// --- 3c. Properties Block (inside Define) ---
 			if isProperties {
-				if currentCtxType != CtxComponentDef { return fmt.Errorf("L%d: 'Properties' block must be directly inside a 'Define' block", currentLineNum) }
-				foundProperties := false; for i := len(blockStack) - 1; i >= 0; i-- { if blockStack[i].Type == CtxComponentDef { break }; if blockStack[i].Type == CtxProperties { foundProperties = true; break } }; if foundProperties { return fmt.Errorf("L%d: multiple 'Properties' blocks are invalid", currentLineNum) }
-				if len(blockStack) >= MaxBlockDepth { return fmt.Errorf("L%d: max block depth exceeded", currentLineNum) }
-				blockStack = append(blockStack, BlockStackEntry{indent, nil, CtxProperties}); continue // Handled Properties
+				if currentCtxType != CtxComponentDef {
+					return fmt.Errorf("L%d: 'Properties' block must be directly inside a 'Define' block", currentLineNum)
+				}
+				def, ok := currentContext.(*ComponentDefinition)
+				if !ok {
+					return fmt.Errorf("L%d: internal error: context for Properties block is not *ComponentDefinition", currentLineNum)
+				}
+
+				if def.DefinitionRootElementIndex != -1 {
+					return fmt.Errorf("L%d: 'Properties' block must come before the root element definition within 'Define %s'", currentLineNum, def.Name)
+				}
+				for _, entry := range blockStack { // Check for duplicate 'Properties' block in current CtxComponentDef
+					if entry.Type == CtxProperties && entry.Context == currentContext {
+						return fmt.Errorf("L%d: multiple 'Properties' blocks are invalid within 'Define %s'", currentLineNum, def.Name)
+					}
+				}
+				if len(blockStack) >= MaxBlockDepth {
+					return fmt.Errorf("L%d: max block depth exceeded", currentLineNum)
+				}
+				blockStack = append(blockStack, BlockStackEntry{indent, currentContext, CtxProperties})
+				continue
 			}
 
 			// --- 3d. Element/Component Block Start ---
 			if isElement {
 				elementName := strings.Fields(blockContent)[0]
-				parentIndex := -1; var parentElement *Element; validNestingContext := false
+				parentIndex := -1
+				var parentElement *Element
+				var componentDefContext *ComponentDefinition // Used if this element is a definition root
+				isDefinitionRoot := false
 
-				// Determine if nesting is valid based on current context
 				switch currentCtxType {
-				case CtxNone: // Root element (App or Component usage)
-					validNestingContext = true
-				case CtxElement: // Standard nesting inside another element
-					parentElement = currentContext.(*Element); parentIndex = parentElement.SelfIndex; validNestingContext = true
-				case CtxComponentDef: // Potential root element *inside* Define { }
+				case CtxNone: // Top-level element (App or component usage)
+				case CtxElement: // Nested inside another element
+					parentElement = currentContext.(*Element)
+					parentIndex = parentElement.SelfIndex
+				case CtxComponentDef: // This element is the root of a component definition
 					def := currentContext.(*ComponentDefinition)
-					if def.DefinitionRootType == "" { // Capturing the root type of the definition
-						def.DefinitionRootType = elementName; log.Printf("      Def root: %s\n", elementName)
-						if len(blockStack) >= MaxBlockDepth { return fmt.Errorf("L%d: max block depth exceeded", currentLineNum) }
-						blockStack = append(blockStack, BlockStackEntry{indent, nil, CtxComponentDefBody}); continue // Switch context to Body
-					} else { // Element start after root but directly under Define - invalid place
-						log.Printf("L%d: Warning: Element '%s' inside Define '%s' block but *after* root type definition. Expected 'Properties' or end of block. Block ignored.", currentLineNum, elementName, def.Name)
-						if len(blockStack) >= MaxBlockDepth { return fmt.Errorf("L%d: max block depth exceeded", currentLineNum) }
-						blockStack = append(blockStack, BlockStackEntry{indent, nil, CtxNone}); continue // Ignore block
+					if def.DefinitionRootElementIndex != -1 {
+						return fmt.Errorf("L%d: multiple root elements defined for 'Define %s'. Previous was at index %d.", currentLineNum, def.Name, def.DefinitionRootElementIndex)
 					}
-				case CtxComponentDefBody: // *** Nested element inside the Define body - IGNORE ***
-					defName := "unknown"; parentDefCtx := findParentContext(blockStack, CtxComponentDef); if parentDefCtx != nil { defName = parentDefCtx.(*ComponentDefinition).Name }
-					log.Printf("L%d: Warning: Nested element '%s' inside Define '%s' body is not supported by expansion. Block ignored.", currentLineNum, elementName, defName)
-					if len(blockStack) >= MaxBlockDepth { return fmt.Errorf("L%d: max block depth exceeded", currentLineNum) }
-					blockStack = append(blockStack, BlockStackEntry{indent, nil, CtxNone}); continue // Push dummy context and SKIP processing this line further
+					isDefinitionRoot = true
+					componentDefContext = def // Keep track of the definition this element belongs to
+					parentIndex = -1          // Definition roots have no element parent in the tree structure
+					log.Printf("      Def root: %s for Define %s\n", elementName, def.Name)
+				case CtxProperties, CtxStyle, CtxEdgeInsetProperty:
+					return fmt.Errorf("L%d: cannot define element '%s' directly inside a '%v' block", currentLineNum, elementName, currentCtxType)
 				default:
-					validNestingContext = false // Cannot nest inside Properties, Style, etc.
+					return fmt.Errorf("L%d: internal error: unexpected context type %v when starting element '%s'", currentLineNum, currentCtxType, elementName)
 				}
 
-				if !validNestingContext { return fmt.Errorf("L%d: cannot define element '%s' inside context %v", currentLineNum, elementName, currentCtxType) }
-				if parentElement != nil && indent <= currentIndent { return fmt.Errorf("L%d: child element '%s' must be indented further than parent '%s'", currentLineNum, elementName, parentElement.SourceElementName) }
-				if len(state.Elements) >= MaxElements { return fmt.Errorf("L%d: maximum elements (%d) exceeded", currentLineNum, MaxElements) }
+				if len(state.Elements) >= MaxElements {
+					return fmt.Errorf("L%d: maximum elements (%d) exceeded", currentLineNum, MaxElements)
+				}
 
-				// Create Element struct
 				elementIndex := len(state.Elements)
-				el := Element{ SelfIndex: elementIndex, ParentIndex: parentIndex, SourceElementName: elementName, SourceLineNum: currentLineNum, CalculatedSize: KRBElementHeaderSize, SourceProperties: make([]SourceProperty, 0, 8), KrbProperties: make([]KrbProperty, 0, 8), KrbEvents: make([]KrbEvent, 0, 2), SourceChildrenIndices: make([]int, 0, 4), Children: make([]*Element, 0, 4), }
-
-				// Check if it's a defined component usage or a standard element
-				compDef := state.findComponentDef(elementName)
-				if compDef != nil { // Component Usage
-					el.Type = ElemTypeInternalComponentUsage; el.ComponentDef = compDef; el.IsComponentInstance = true
-				} else { // Standard Element
-					el.Type = getElementTypeFromName(elementName); el.IsComponentInstance = false
-					if el.Type == ElemTypeUnknown {
-						el.Type = ElemTypeCustomBase; nameIdx, err := state.addString(elementName); if err != nil { return fmt.Errorf("L%d: failed adding custom element name '%s': %w", currentLineNum, elementName, err) }; el.IDStringIndex = nameIdx
-						log.Printf("L%d: Warn: Unknown element type '%s', using custom type 0x%X with name index %d\n", currentLineNum, elementName, el.Type, nameIdx)
-					}
-					// Root Checks
-					if el.Type == ElemTypeApp { if state.HasApp || parentElement != nil { return fmt.Errorf("L%d: 'App' element must be the single root element", currentLineNum) }; state.HasApp = true; state.HeaderFlags |= FlagHasApp } else { if parentElement == nil && !state.HasApp { return fmt.Errorf("L%d: root element must be 'App', found '%s'", currentLineNum, elementName) } }
+				el := Element{
+					SelfIndex: elementIndex, ParentIndex: parentIndex, SourceElementName: elementName, SourceLineNum: currentLineNum,
+					CalculatedSize: KRBElementHeaderSize, SourceProperties: make([]SourceProperty, 0, 8),
+					KrbProperties: make([]KrbProperty, 0, 8), KrbCustomProperties: make([]KrbCustomProperty, 0, 2),
+					KrbEvents: make([]KrbEvent, 0, 2), SourceChildrenIndices: make([]int, 0, 4),
+					Children: make([]*Element, 0, 4),
+					IsDefinitionRoot: isDefinitionRoot, // 'isDefinitionRoot' is true ONLY if currentCtxType == CtxComponentDef
 				}
 
-				// Add element to state, update parent's children, push to stack
+				if parentElement != nil && parentElement.IsDefinitionRoot {
+					el.IsDefinitionRoot = true
+				}
+
+				if compDef := state.findComponentDef(elementName); compDef != nil { // Component Usage
+					if isDefinitionRoot {
+						return fmt.Errorf("L%d: cannot use component '%s' as the root element definition for 'Define %s'. Root must be a standard element type.", currentLineNum, elementName, componentDefContext.Name)
+					}
+					el.Type = ElemTypeInternalComponentUsage // Placeholder type, resolved later
+					el.ComponentDef = compDef
+					el.IsComponentInstance = true
+				} else { // Standard Element or root of a Definition
+					el.Type = getElementTypeFromName(elementName)
+					if el.Type == ElemTypeUnknown { // Potentially a custom element type
+						el.Type = ElemTypeCustomBase // Default to custom if not standard
+						nameIdx, err := state.addString(elementName)
+						if err != nil {
+							return fmt.Errorf("L%d: failed adding custom element name '%s': %w", currentLineNum, elementName, err)
+						}
+						el.IDStringIndex = nameIdx // Store its name as ID for runtime
+						log.Printf("L%d: Warn: Unknown element type '%s', treating as custom (type 0x%X with name index %d)\n", currentLineNum, elementName, el.Type, nameIdx)
+					}
+					if !isDefinitionRoot { // Root checks only for main UI tree elements
+						if el.Type == ElemTypeApp {
+							if state.HasApp || parentElement != nil {
+								return fmt.Errorf("L%d: 'App' element must be the single root element", currentLineNum)
+							}
+							state.HasApp = true
+							state.HeaderFlags |= FlagHasApp
+						} else if parentElement == nil && !state.HasApp && !el.IsComponentInstance {
+							return fmt.Errorf("L%d: root element must be 'App' or a component usage, found standard element '%s'", currentLineNum, elementName)
+						}
+					}
+				}
+
 				state.Elements = append(state.Elements, el)
 				currentElement := &state.Elements[elementIndex]
-				if parentElement != nil { if len(parentElement.SourceChildrenIndices) >= MaxChildren { return fmt.Errorf("L%d: maximum children (%d) exceeded for parent '%s'", currentLineNum, MaxChildren, parentElement.SourceElementName) }; parentElement.SourceChildrenIndices = append(parentElement.SourceChildrenIndices, currentElement.SelfIndex) }
-				if len(blockStack) >= MaxBlockDepth { return fmt.Errorf("L%d: max block depth exceeded", currentLineNum) }
-				blockStack = append(blockStack, BlockStackEntry{indent, currentElement, CtxElement}); continue // Handled element start
+
+				if parentElement != nil { // Add to parent's children if normally nested
+					if len(parentElement.SourceChildrenIndices) >= MaxChildren {
+						return fmt.Errorf("L%d: max children (%d) for parent '%s'", currentLineNum, MaxChildren, parentElement.SourceElementName)
+					}
+					parentElement.SourceChildrenIndices = append(parentElement.SourceChildrenIndices, currentElement.SelfIndex)
+				}
+				if isDefinitionRoot && componentDefContext != nil { // Link definition to its root element
+					componentDefContext.DefinitionRootElementIndex = currentElement.SelfIndex
+				}
+
+				if len(blockStack) >= MaxBlockDepth {
+					return fmt.Errorf("L%d: max block depth exceeded", currentLineNum)
+				}
+				blockStack = append(blockStack, BlockStackEntry{indent, currentElement, CtxElement})
+				continue
 			}
 
-
+			// --- 3e. Edge Inset Block Start ---
 			parts := strings.SplitN(blockContent, ":", 2)
 			if len(parts) == 2 {
 				key := strings.TrimSpace(parts[0])
-				val := strings.TrimSpace(parts[1]) // Should be empty if line ends in '{'
-
-				// Check if the key is 'padding' or 'margin' and the value part is empty
-				if (key == "padding" || key == "margin") && val == "" {
-					// Found "padding: {" or "margin: {"
-
-					// Check if the current context allows starting this block
-					if currentCtxType != CtxElement && currentCtxType != CtxStyle && currentCtxType != CtxComponentDefBody {
-						 // Added CtxComponentDefBody as valid parent
-						 return fmt.Errorf("L%d: '%s: {' block must be inside an Element, Style, or Define Body", currentLineNum, key)
+				val := strings.TrimSpace(parts[1])
+				if (key == "padding" || key == "margin") && val == "" { // Expecting "padding: {"
+					if currentCtxType != CtxElement && currentCtxType != CtxStyle {
+						return fmt.Errorf("L%d: '%s: {' block must be inside an Element or Style block (current: %v)", currentLineNum, key, currentCtxType)
 					}
 					if len(blockStack) >= MaxBlockDepth {
-						 return fmt.Errorf("L%d: max block depth exceeded starting '%s: {'", currentLineNum, key)
+						return fmt.Errorf("L%d: max block depth for '%s: {'", currentLineNum, key)
 					}
-
-                    // Create the state object for parsing edge insets
-                    edgeState := &EdgeInsetParseState{
-                        ParentKey:     key,           // Store "padding" or "margin"
-                        ParentCtx:     currentContext,// Store reference to the parent (*Element, *StyleEntry, or *ComponentDefinition)
-                        ParentCtxType: currentCtxType, // Store the type of the parent context
-                        Indent:        indent,        // Store block's indent level
-                        StartLine:     currentLineNum, // Store starting line number
-						// Top, Right, Bottom, Left start as nil
-                    }
-
-                    // Push the new context onto the stack
+					edgeState := &EdgeInsetParseState{
+						ParentKey: key, ParentCtx: currentContext, ParentCtxType: currentCtxType,
+						Indent: indent, StartLine: currentLineNum,
+					}
 					blockStack = append(blockStack, BlockStackEntry{Indent: indent, Context: edgeState, Type: CtxEdgeInsetProperty})
-					log.Printf("   Start Edge Inset Block for '%s'\n", key)
-					continue // Handled padding/margin block start, move to next line
+					// log.Printf("   Start Edge Inset Block for '%s'\n", key)
+					continue
 				}
 			}
+			return fmt.Errorf("L%d: invalid block start syntax: '%s'", currentLineNum, trimmed)
+		}
 
-			// If block opened but wasn't Define, Style, Properties, or Element
-			return fmt.Errorf("L%d: invalid block start syntax: '%s'", currentLineNum, trimmed) // Use trimmed which includes '{' here
+		// --- 4. Process Non-Block-Starting Lines (Properties) ---
+		if !(len(blockStack) > 0 && indent > currentIndent) { // Must be indented within a block
+			msg := "unexpected syntax or indentation"
+			if len(blockStack) == 0 {
+				msg = "unexpected syntax at top level (expected block definition)"
+			}
+			return fmt.Errorf("L%d: %s: '%s'", currentLineNum, msg, trimmed)
+		}
 
-		} // --- End of `if blockOpened` ---
+		parts := strings.SplitN(trimmed, ":", 2)
+		keyPart := ""
+		if len(parts) > 0 {
+			keyPart = strings.TrimSpace(parts[0])
+		}
+		isPropertyLike := len(parts) == 2 && len(keyPart) > 0 && !strings.ContainsAny(keyPart, "{}")
 
-		// --- 4. Process Non-Block-Starting Lines (Properties / Ignored Content) ---
-		// This section only runs if the line did NOT start a block
-		if len(blockStack) > 0 && indent > currentIndent {
-			// Line is indented relative to current block context.
+		contextType := currentCtxType
+		contextObject := currentContext
 
-			// Check if it looks like 'key: value', ensuring key doesn't contain '{' or '}'
-			parts := strings.SplitN(trimmed, ":", 2)
-			keyPart := ""; if len(parts) > 0 { keyPart = strings.TrimSpace(parts[0]) }
-			isPropertyLike := len(parts) == 2 && len(keyPart) > 0 && !strings.ContainsAny(keyPart, "{}")
+		switch contextType {
+		case CtxProperties: // Inside Define -> Properties { key: Type [= Default] }
+			if !isPropertyLike {
+				return fmt.Errorf("L%d: invalid syntax in Properties (expected 'key: Type [= Default]'): '%s'", currentLineNum, trimmed)
+			}
+			key := keyPart
+			valueStr := strings.TrimSpace(parts[1])
+			parentComponentDef, ok := contextObject.(*ComponentDefinition)
+			if !ok {
+				return fmt.Errorf("L%d: internal error: CtxProperties not *ComponentDefinition", currentLineNum)
+			}
 
-			// Check if it looks like an element start (even without blockOpened being true)
-			// This helps catch ignored element lines more reliably in Step 4 contexts
-			firstWord := ""; if fw := strings.Fields(trimmed); len(fw) > 0 { firstWord = fw[0] }
-			startsWithElement := len(firstWord) > 0 && unicode.IsUpper(rune(firstWord[0])) && strings.Contains(trimmed, "{")
+			valParts := strings.SplitN(valueStr, "=", 2)
+			propTypeStr := strings.TrimSpace(valParts[0])
+			propDefault := ""
+			if len(valParts) == 2 {
+				propDefault = strings.TrimSpace(valParts[1])
+			}
+			if len(parentComponentDef.Properties) >= MaxProperties {
+				return fmt.Errorf("L%d: max props (%d) for component '%s'", currentLineNum, MaxProperties, parentComponentDef.Name)
+			}
 
-			// Get current context details
-			entry := blockStack[len(blockStack)-1]
-			contextType := entry.Type
-			contextObject := entry.Context // Can be *Element, *StyleEntry, *ComponentDefinition, or nil
-
-			// Process based on the context
-			switch contextType {
-			case CtxProperties: // Inside Define -> Properties { }
-				if startsWithElement { log.Printf("L%d: Warning: Ignoring line starting like element inside Properties block: '%s'", currentLineNum, trimmed); continue }
-				if !isPropertyLike { return fmt.Errorf("L%d: invalid syntax inside Properties block (expected 'key: Type [= DefaultValue]'): '%s'", currentLineNum, trimmed) }
-				key := keyPart; valueStr := strings.TrimSpace(parts[1])
-				parentDef := findParentContext(blockStack, CtxComponentDef); if parentDef == nil { return fmt.Errorf("L%d: internal error: CtxProperties without parent CtxComponentDef", currentLineNum) }
-				parentComponentDef := parentDef.(*ComponentDefinition)
-				valParts := strings.SplitN(valueStr, "=", 2); propType := strings.TrimSpace(valParts[0]); propDefault := ""; if len(valParts) == 2 { propDefault = strings.TrimSpace(valParts[1]) /* keep quotes */ }
-				if len(parentComponentDef.Properties) >= MaxProperties { return fmt.Errorf("L%d: max properties defined", currentLineNum) }
-				pd := ComponentPropertyDef{Name: key, DefaultValueStr: propDefault}; switch propType { case "String": pd.ValueTypeHint = ValTypeString; case "Int": pd.ValueTypeHint = ValTypeShort; case "Bool": pd.ValueTypeHint = ValTypeByte; case "Color": pd.ValueTypeHint = ValTypeColor; case "StyleID": pd.ValueTypeHint = ValTypeStyleID; case "Resource": pd.ValueTypeHint = ValTypeResource; case "Float": pd.ValueTypeHint = ValTypeFloat; default: log.Printf("L%d: Warn: Unknown prop type hint '%s' for '%s'", currentLineNum, propType, key); pd.ValueTypeHint = ValTypeCustom }; parentComponentDef.Properties = append(parentComponentDef.Properties, pd)
-
-
-            case CtxEdgeInsetProperty:
-                // We are inside a "padding: {" or "margin: {" block.
-                // We expect lines like "top: 10", "right: 5", etc.
-
-                // First, check if the line even looks like a property ('key: value').
-                if !isPropertyLike {
-                     // If it doesn't look like 'key: value', it might be a comment
-                     // or just an empty/invalid line within the block.
-                     // We ignore comments and empty lines silently.
-                     // Log a warning for other invalid syntax inside the block.
-                     if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
-						// Get parent key for better error message, default if context is weird
-						parentKey := "edge inset"
-						if edgeState, ok := contextObject.(*EdgeInsetParseState); ok && edgeState != nil {
-							parentKey = edgeState.ParentKey
-						}
-                        log.Printf("L%d: Warning: Invalid syntax inside '%s: {}' block (expected 'key: value'): '%s'. Line ignored.", currentLineNum, parentKey, trimmed)
-                     }
-                     // Skip processing this line further.
-                     continue // Move to the next line in the source file.
-                }
-
-                // If it looks like 'key: value', extract the key and value parts.
-                // keyPart and parts are already defined earlier in the loop.
-                key := keyPart                       // e.g., "top", "right"
-                valueStr := strings.TrimSpace(parts[1]) // e.g., "10", "\"auto\"" - Keep quotes for now
-
-                // Get the current edge inset state object from the context stack.
-                edgeState, ok := contextObject.(*EdgeInsetParseState)
-                if !ok || edgeState == nil {
-					// This indicates an internal compiler error - the context should be correct here.
-					return fmt.Errorf("L%d: Internal error: Invalid context object for CtxEdgeInsetProperty", currentLineNum)
-				}
-
-                // Store the raw value string (including quotes if any) based on the key.
-                // We use pointers in EdgeInsetParseState, so store the address of the string.
-                // Note: We don't parse the numeric value here; we store the raw string.
-                // The conversion to long-form SourceProperty happens when '}' is found.
-                switch key {
-                case "top":
-                     // Check if 'top' was already set in this block.
-                     if edgeState.Top != nil {
-                         log.Printf("L%d: Warning: duplicate 'top' key in '%s' block. Overwriting previous value.", currentLineNum, edgeState.ParentKey)
-                     }
-                     // Store the address of the value string.
-                     edgeState.Top = &valueStr
-                case "right":
-                     if edgeState.Right != nil {
-                         log.Printf("L%d: Warning: duplicate 'right' key in '%s' block. Overwriting previous value.", currentLineNum, edgeState.ParentKey)
-                     }
-                     edgeState.Right = &valueStr
-                case "bottom":
-                     if edgeState.Bottom != nil {
-                         log.Printf("L%d: Warning: duplicate 'bottom' key in '%s' block. Overwriting previous value.", currentLineNum, edgeState.ParentKey)
-                     }
-                     edgeState.Bottom = &valueStr
-                case "left":
-                     if edgeState.Left != nil {
-                         log.Printf("L%d: Warning: duplicate 'left' key in '%s' block. Overwriting previous value.", currentLineNum, edgeState.ParentKey)
-                     }
-                     edgeState.Left = &valueStr
-                default:
-                    // The key is not one of the expected edge inset keys (top, right, bottom, left).
-                    log.Printf("L%d: Warning: Unexpected key '%s' found inside '%s: {}' block. Property ignored.", currentLineNum, key, edgeState.ParentKey)
-                    // We simply ignore unexpected keys within this block.
-                }
-                // Finished processing this line within the edge inset block.
-                continue // Move to the next line.
-				
-			case CtxStyle: // Inside style "name" { }
-				if !isPropertyLike { return fmt.Errorf("L%d: invalid property syntax inside Style block (expected 'key: value'): '%s'", currentLineNum, trimmed) }
-				key := keyPart; valueStrRaw := strings.TrimSpace(parts[1]) // Keep raw value for addSourceProperty if needed
-				if contextObject == nil { return fmt.Errorf("L%d: internal error: nil context for CtxStyle", currentLineNum) }
-				parentStyle := contextObject.(*StyleEntry)
-
-				// *** Process 'extends' specifically ***
-				if key == "extends" {
-					// Clean the value to get the base name *without* comments or quotes
-					baseName, _ := cleanAndQuoteValue(valueStrRaw) // Use helper
-					if baseName == "" { return fmt.Errorf("L%d: 'extends' requires non-empty base style name in style '%s'", currentLineNum, parentStyle.SourceName) }
-					if baseName == parentStyle.SourceName { return fmt.Errorf("L%d: style '%s' cannot extend itself", currentLineNum, parentStyle.SourceName) }
-					if parentStyle.ExtendsStyleName != "" { return fmt.Errorf("L%d: style '%s' specifies 'extends' multiple times", currentLineNum, parentStyle.SourceName) }
-
-					// Store the CLEANED base name
-					parentStyle.ExtendsStyleName = baseName
-					log.Printf("   Parsed Style Extends: %s -> %s\n", parentStyle.SourceName, baseName)
-					// NOTE: We DO NOT call addSourceProperty for 'extends' itself.
+			pd := ComponentPropertyDef{Name: key, DefaultValueStr: propDefault}
+			switch propTypeStr {
+			case "String":
+				pd.ValueTypeHint = ValTypeString
+			case "Int":
+				pd.ValueTypeHint = ValTypeInt
+			case "Bool":
+				pd.ValueTypeHint = ValTypeBool
+			case "Color":
+				pd.ValueTypeHint = ValTypeColor
+			case "StyleID":
+				pd.ValueTypeHint = ValTypeStyleID
+			case "Resource":
+				pd.ValueTypeHint = ValTypeResource
+			case "Float":
+				pd.ValueTypeHint = ValTypeFloat
+			default:
+				if strings.HasPrefix(propTypeStr, "Enum(") && strings.HasSuffix(propTypeStr, ")") {
+					pd.ValueTypeHint = ValTypeEnum
 				} else {
-					// Call the method directly on the style entry
-					err := parentStyle.addSourceProperty(key, valueStrRaw, currentLineNum) // Calls method defined in constants.go
-					if err != nil {
-						return fmt.Errorf("L%d: %w", currentLineNum, err)
-					}
+					log.Printf("L%d: Warn: Unknown property type '%s' for '%s'. Treating as custom hint.", currentLineNum, propTypeStr, key)
+					pd.ValueTypeHint = ValTypeCustom
 				}
-			
-			case CtxElement: // Inside Element { }
-				if startsWithElement { log.Printf("L%d: Warning: Ignoring line starting like element inside Element block '%s': '%s'", currentLineNum, contextObject.(*Element).SourceElementName, trimmed); continue }
-				if !isPropertyLike { return fmt.Errorf("L%d: invalid property syntax inside Element '%s' (expected 'key: value'): '%s'", currentLineNum, contextObject.(*Element).SourceElementName, trimmed) }
-				key := keyPart; valueStr := strings.TrimSpace(parts[1]) // Keep quotes/spacing
-				parentElement := contextObject.(*Element)
-				err := parentElement.addSourceProperty(key, valueStr, currentLineNum); if err != nil { return err }
+			}
+			parentComponentDef.Properties = append(parentComponentDef.Properties, pd)
+			continue
 
-			case CtxComponentDefBody: // Inside Define -> RootType { }
-				parentDef := findParentContext(blockStack, CtxComponentDef); if parentDef == nil { return fmt.Errorf("L%d: internal error: CtxComponentDefBody without parent CtxComponentDef", currentLineNum) }
-				parentComponentDef := parentDef.(*ComponentDefinition)
-				// *** Explicitly ignore lines that start like elements ***
-				if startsWithElement {
-					log.Printf("L%d: Warning: Ignoring nested element-like line inside Define '%s' body: '%s'", currentLineNum, parentComponentDef.Name, trimmed)
-				} else if !isPropertyLike { // Not element-like, not property-like
-					log.Printf("L%d: Warning: Ignoring unexpected line inside Define '%s' body (not 'key: value'): '%s'", currentLineNum, parentComponentDef.Name, trimmed)
-				} else { // Looks like a property for the root element definition
-					key := keyPart; valueStr := strings.TrimSpace(parts[1]) // Keep quotes/spacing
-					if parentComponentDef.DefinitionRootType == "" { return fmt.Errorf("L%d: internal error: property '%s' found in component definition body before root element type was defined", currentLineNum, key) }
-					err := parentComponentDef.addDefinitionRootProperty(key, valueStr, currentLineNum); if err != nil { return err }
+		case CtxEdgeInsetProperty: // Inside padding: { top: N }
+			if !isPropertyLike {
+				if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+					log.Printf("L%d: Warn: Invalid syntax in edge inset block: '%s'. Ignored.", currentLineNum, trimmed)
 				}
-
-			case CtxComponentDef: // Directly under Define { } - Warn and ignore
-				if startsWithElement { log.Printf("L%d: Warning: Ignoring line starting like element directly under Define block: '%s'", currentLineNum, trimmed); continue }
-				if isPropertyLike { log.Printf("L%d: Warning: Property '%s' found directly under Define block, expected inside 'Properties' or root element body. Ignoring.", currentLineNum, keyPart) } else { log.Printf("L%d: Warning: Ignoring unexpected line directly under Define block: '%s'", currentLineNum, trimmed) }
-
-			default: // Includes CtxNone (inside ignored blocks) - Ignore silently
-				if startsWithElement || isPropertyLike { log.Printf("L%d: Debug: Ignoring indented line in context %v: '%s'\n", currentLineNum, contextType, trimmed) }
+				continue
+			}
+			key := keyPart
+			valueStr := strings.TrimSpace(parts[1])
+			edgeState, ok := contextObject.(*EdgeInsetParseState)
+			if !ok {
+				return fmt.Errorf("L%d: internal error: CtxEdgeInsetProperty not *EdgeInsetParseState", currentLineNum)
 			}
 
-			continue // Handled (or ignored) indented line
+			switch key {
+			case "top":
+				if edgeState.Top != nil {
+					log.Printf("L%d: Warn: duplicate 'top' in '%s'.", currentLineNum, edgeState.ParentKey)
+				}
+				edgeState.Top = &valueStr
+			case "right":
+				if edgeState.Right != nil {
+					log.Printf("L%d: Warn: duplicate 'right' in '%s'.", currentLineNum, edgeState.ParentKey)
+				}
+				edgeState.Right = &valueStr
+			case "bottom":
+				if edgeState.Bottom != nil {
+					log.Printf("L%d: Warn: duplicate 'bottom' in '%s'.", currentLineNum, edgeState.ParentKey)
+				}
+				edgeState.Bottom = &valueStr
+			case "left":
+				if edgeState.Left != nil {
+					log.Printf("L%d: Warn: duplicate 'left' in '%s'.", currentLineNum, edgeState.ParentKey)
+				}
+				edgeState.Left = &valueStr
+			case "all":
+				if edgeState.Top != nil || edgeState.Right != nil || edgeState.Bottom != nil || edgeState.Left != nil {
+					log.Printf("L%d: Warn: 'all' after individual sides in '%s'. Ignored.", currentLineNum, edgeState.ParentKey)
+				} else {
+					edgeState.Top = &valueStr
+					edgeState.Right = &valueStr
+					edgeState.Bottom = &valueStr
+					edgeState.Left = &valueStr
+				}
+			case "horizontal":
+				if edgeState.Left != nil || edgeState.Right != nil {
+					log.Printf("L%d: Warn: 'horizontal' after left/right in '%s'. Ignored.", currentLineNum, edgeState.ParentKey)
+				} else {
+					edgeState.Left = &valueStr
+					edgeState.Right = &valueStr
+				}
+			case "vertical":
+				if edgeState.Top != nil || edgeState.Bottom != nil {
+					log.Printf("L%d: Warn: 'vertical' after top/bottom in '%s'. Ignored.", currentLineNum, edgeState.ParentKey)
+				} else {
+					edgeState.Top = &valueStr
+					edgeState.Bottom = &valueStr
+				}
+			default:
+				log.Printf("L%d: Warn: Unexpected key '%s' in '%s: {}'. Ignored.", currentLineNum, key, edgeState.ParentKey)
+			}
+			continue
 
-		} // End indented line handling
+		case CtxStyle: // Inside style "name" { key: value }
+			if !isPropertyLike {
+				return fmt.Errorf("L%d: invalid property syntax in Style block: '%s'", currentLineNum, trimmed)
+			}
+			key := keyPart
+			valueStrRaw := strings.TrimSpace(parts[1])
+			parentStyle, ok := contextObject.(*StyleEntry)
+			if !ok {
+				return fmt.Errorf("L%d: internal error: CtxStyle not *StyleEntry", currentLineNum)
+			}
 
-		// --- 5. Handle Errors for Lines That Don't Match Above ---
-		// Line wasn't block end, block start, or indented property/ignored content
-		if indent <= currentIndent && len(blockStack) > 0 { return fmt.Errorf("L%d: unexpected syntax or indentation decrease: '%s'", currentLineNum, trimmed) }
-		if indent > currentIndent && len(blockStack) == 0 { return fmt.Errorf("L%d: unexpected indentation at top level: '%s'", currentLineNum, trimmed) }
-		if !blockOpened && (isDefine || isStyle || isProperties || isElement) { return fmt.Errorf("L%d: missing '{' to start block: '%s'", currentLineNum, trimmed) }
-		return fmt.Errorf("L%d: unrecognized syntax: '%s'", currentLineNum, trimmed)
+			if key == "extends" {
+				if len(parentStyle.ExtendsStyleNames) > 0 {
+					return fmt.Errorf("L%d: style '%s' 'extends' multiple times", currentLineNum, parentStyle.SourceName)
+				}
+				if len(parentStyle.SourceProperties) > 0 {
+					log.Printf("L%d: Warn: 'extends' should be first in style '%s'.", currentLineNum, parentStyle.SourceName)
+				}
 
-	} // End scanner loop
+				trimmedValue := strings.TrimSpace(valueStrRaw)
+				var baseNames []string
+				if strings.HasPrefix(trimmedValue, "[") && strings.HasSuffix(trimmedValue, "]") { // List of styles
+					content := strings.TrimSpace(trimmedValue[1 : len(trimmedValue)-1])
+					if content != "" {
+						for _, pn := range strings.Split(content, ",") {
+							cn, wq := cleanAndQuoteValue(pn)
+							if !wq || cn == "" {
+								return fmt.Errorf("L%d: invalid style name '%s' in 'extends' for '%s'", currentLineNum, pn, parentStyle.SourceName)
+							}
+							if cn == parentStyle.SourceName {
+								return fmt.Errorf("L%d: style '%s' cannot extend itself", currentLineNum, parentStyle.SourceName)
+							}
+							baseNames = append(baseNames, cn)
+						}
+						if len(baseNames) == 0 {
+							return fmt.Errorf("L%d: empty 'extends' list for '%s'", currentLineNum, parentStyle.SourceName)
+						}
+					}
+				} else { // Single style name
+					bn, wq := cleanAndQuoteValue(trimmedValue)
+					if !wq || bn == "" {
+						return fmt.Errorf("L%d: 'extends' needs quoted name or list for '%s', got '%s'", currentLineNum, parentStyle.SourceName, trimmedValue)
+					}
+					if bn == parentStyle.SourceName {
+						return fmt.Errorf("L%d: style '%s' cannot extend itself", currentLineNum, parentStyle.SourceName)
+					}
+					baseNames = []string{bn}
+				}
+				parentStyle.ExtendsStyleNames = baseNames
+				// log.Printf("   Parsed Style Extends: %s -> %v\n", parentStyle.SourceName, baseNames)
+			} else {
+				if err := parentStyle.addSourceProperty(key, valueStrRaw, currentLineNum); err != nil {
+					return fmt.Errorf("L%d: %w", currentLineNum, err)
+				}
+			}
+			continue
 
-	if err := scanner.Err(); err != nil { return fmt.Errorf("error reading source buffer: %w", err) }
+		case CtxElement: // Inside Element { key: value } (applies to main tree elements AND template definition roots)
+			if !isPropertyLike {
+				if fields := strings.Fields(trimmed); len(fields) > 0 && unicode.IsUpper(rune(fields[0][0])) {
+					return fmt.Errorf("L%d: potential nested element '%s' needs its own block '{'", currentLineNum, fields[0])
+				}
+				elName := "unknown element"
+				if elCtx, ok := contextObject.(*Element); ok {
+					elName = elCtx.SourceElementName
+				}
+				return fmt.Errorf("L%d: invalid property syntax in Element '%s' (expected 'key: value'): '%s'", currentLineNum, elName, trimmed)
+			}
+			key := keyPart
+			valueStr := strings.TrimSpace(parts[1])
+			currentElement, ok := contextObject.(*Element)
+			if !ok {
+				return fmt.Errorf("L%d: internal error: CtxElement not *Element", currentLineNum)
+			}
+
+			if err := currentElement.addSourceProperty(key, valueStr, currentLineNum); err != nil {
+				return err
+			}
+			continue
+
+		case CtxComponentDef: // Properties are not allowed directly under "Define Name {", only "Properties {}" or the root element
+			log.Printf("L%d: Warning: Property '%s' directly under Define block. Ignored. Use 'Properties {}' or define on root element.", currentLineNum, keyPart)
+			continue
+
+		default: // Should not happen if block stack logic is correct
+			if contextType == CtxNone {
+				continue
+			} // Ignore indented lines at top level if they slip through somehow
+			return fmt.Errorf("L%d: internal error: unexpected context %v for property line '%s'", currentLineNum, contextType, trimmed)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading source buffer: %w", err)
+	}
 
 	// --- Final Checks ---
-	if len(blockStack) != 0 { return fmt.Errorf("unclosed block at end of file (last context: %v)", blockStack[len(blockStack)-1].Type) }
-	if !state.HasApp {
-		isRootComponent := len(state.Elements) > 0 && state.Elements[0].IsComponentInstance
-		if !isRootComponent && (len(state.Elements) == 0 || state.Elements[0].Type != ElemTypeApp) {
-			appFound := false; for _, el := range state.Elements { if el.Type == ElemTypeApp { appFound = true; break } }
-			if !appFound { return errors.New("no 'App' element defined") }
-			return errors.New("'App' element found but it's not the root element")
+	if len(blockStack) != 0 {
+		// ... (Your existing unclosed block error reporting is good) ...
+		lastEntry := blockStack[len(blockStack)-1]
+		contextStr := fmt.Sprintf("%v", lastEntry.Type)
+		// Add more specific context if possible
+		switch lastEntry.Type {
+		case CtxElement:
+			if el, ok := lastEntry.Context.(*Element); ok {
+				contextStr = fmt.Sprintf("Element '%s' L%d", el.SourceElementName, el.SourceLineNum)
+			}
+		case CtxStyle:
+			if st, ok := lastEntry.Context.(*StyleEntry); ok {
+				contextStr = fmt.Sprintf("Style '%s'", st.SourceName)
+			}
+		case CtxComponentDef:
+			if def, ok := lastEntry.Context.(*ComponentDefinition); ok {
+				contextStr = fmt.Sprintf("Define '%s' L%d", def.Name, def.DefinitionStartLine)
+			}
+		case CtxProperties:
+			contextStr = "Properties block" // Could find parent Define name if needed
+		case CtxEdgeInsetProperty:
+			if es, ok := lastEntry.Context.(*EdgeInsetParseState); ok {
+				contextStr = fmt.Sprintf("'%s: {}' L%d", es.ParentKey, es.StartLine)
+			}
 		}
-		if isRootComponent { log.Println("Info: Root element is a component. Assuming 'App' behavior is provided."); state.HasApp = true }
+		return fmt.Errorf("unclosed block at end of file (last open: %s)", contextStr)
 	}
-	return nil // Success
+
+	// Root element validation
+	rootElementIndex := -1
+	for i, el := range state.Elements {
+		if el.ParentIndex == -1 && !el.IsDefinitionRoot { // Is a main UI tree root element
+			rootElementIndex = i
+			break
+		}
+	}
+
+	if rootElementIndex == -1 { // No main UI tree root found
+		if len(state.Elements) == 0 && len(state.ComponentDefs) == 0 {
+			return errors.New("no content found: define 'App' or components")
+		}
+		if len(state.Elements) > 0 { // Elements exist, but all are template parts
+			onlyTemplateParts := true
+			for _, el := range state.Elements {
+				if !el.IsDefinitionRoot {
+					onlyTemplateParts = false
+					break
+				}
+			}
+			if onlyTemplateParts && len(state.ComponentDefs) > 0 {
+				log.Println("Info: Only component definitions found. No main 'App' element or root component instance.")
+				// This is valid for a component library file.
+			} else {
+				// This case implies elements that are not definition roots but also not identified as main tree roots
+				return errors.New("internal error: elements present but no main UI tree root identified")
+			}
+		} else if len(state.ComponentDefs) > 0 { // Only defs, no elements at all
+			log.Println("Info: Only component definitions found. No main 'App' element or root component instance.")
+		} else { // Should be caught by the first condition of this block
+			return errors.New("no root element defined (must be 'App' or a component instance in the main UI tree)")
+		}
+
+	} else { // Main UI tree root was found
+		rootElement := state.Elements[rootElementIndex]
+		if rootElement.Type != ElemTypeApp && !rootElement.IsComponentInstance {
+			return fmt.Errorf("main UI tree root element must be 'App' or a component instance, but found '%s' (type 0x%X) at L%d", rootElement.SourceElementName, rootElement.Type, rootElement.SourceLineNum)
+		}
+		if rootElement.Type == ElemTypeApp && !state.HasApp { // Ensure HasApp flag consistency
+			state.HasApp = true
+			state.HeaderFlags |= FlagHasApp
+		}
+		if rootElement.IsComponentInstance && !state.HasApp { // Root component instance implies an App wrapper
+			log.Println("Info: Root element is a component instance. Assuming 'App' container behavior.")
+			state.HasApp = true // Mark as having an effective App root conceptually
+		}
+	}
+
+	// Check component definitions
+	for i := range state.ComponentDefs {
+		if state.ComponentDefs[i].DefinitionRootElementIndex == -1 {
+			return fmt.Errorf("component definition 'Define %s' (L%d) is missing its root element template (e.g., Container { ... })", state.ComponentDefs[i].Name, state.ComponentDefs[i].DefinitionStartLine)
+		}
+	}
+
+	return nil
 }
 
-
-// --- State Management Helpers (addString, addResource, find*, etc.) ---
-// --- Property Handling Helpers (addKrbProperty, addSourceProperty, etc.) ---
-// (Paste the helper functions from previous correct versions here)
+// --- Helper functions previously defined (addString, addResource, findComponentDef, findParentContext, etc.) ---
+// --- Element/Style addSourceProperty, addKrbProperty, etc. ---
+// These should remain as they were, as they operate on the correct structs.
 
 // addString adds a string to the state's string table if unique, returning its 0-based index.
 func (state *CompilerState) addString(text string) (uint8, error) {
@@ -475,20 +740,22 @@ func (state *CompilerState) addString(text string) (uint8, error) {
 		return 0, nil
 	}
 	cleaned := trimQuotes(strings.TrimSpace(text))
-	if cleaned == "" {
+	if cleaned == "" { // After cleaning, it might become empty
 		if len(state.Strings) == 0 {
 			state.Strings = append(state.Strings, StringEntry{Text: "", Length: 0, Index: 0})
 		}
 		return 0, nil
 	}
+	// Search for existing non-empty strings (index 0 is reserved for empty)
 	for i := 1; i < len(state.Strings); i++ {
 		if state.Strings[i].Text == cleaned {
 			return state.Strings[i].Index, nil
 		}
 	}
 	if len(state.Strings) >= MaxStrings {
-		return 0, fmt.Errorf("maximum string limit (%d) exceeded", MaxStrings)
+		return 0, fmt.Errorf("maximum string limit (%d) exceeded when adding '%s'", MaxStrings, cleaned)
 	}
+	// Ensure index 0 exists if adding the first non-empty string
 	if len(state.Strings) == 0 {
 		state.Strings = append(state.Strings, StringEntry{Text: "", Length: 0, Index: 0})
 	}
@@ -500,17 +767,23 @@ func (state *CompilerState) addString(text string) (uint8, error) {
 
 // addResource adds a resource if unique, returns 0-based index.
 func (state *CompilerState) addResource(resType uint8, pathStr string) (uint8, error) {
-	pathIdx, err := state.addString(pathStr)
+	pathIdx, err := state.addString(pathStr) // pathStr will be cleaned by addString
 	if err != nil {
 		return 0, fmt.Errorf("failed to add resource path '%s' to string table: %w", pathStr, err)
 	}
-	if pathIdx == 0 && len(strings.TrimSpace(pathStr)) > 0 {
-		return 0, fmt.Errorf("failed to add non-empty resource path '%s' resulting in index 0", pathStr)
+	// addString returns 0 for an empty string. A resource path cannot be meaningfully empty.
+	if pathIdx == 0 && strings.TrimSpace(pathStr) != "" {
+		// This case means addString returned 0, but the original pathStr was not just whitespace.
+		// This could happen if addString had an issue or if the cleaned path became "" but original wasn't.
+		// For safety, ensure that if pathStr was non-empty, we get a non-zero index.
+		// However, addString logic was updated to handle this. This check is more of a safeguard.
+		return 0, fmt.Errorf("resource path '%s' resolved to empty string index", pathStr)
 	}
-	if pathIdx == 0 {
-		return 0, fmt.Errorf("resource path cannot be empty")
+	if pathIdx == 0 && strings.TrimSpace(pathStr) == "" { // Explicitly disallow empty or whitespace-only paths
+		return 0, fmt.Errorf("resource path cannot be empty or whitespace only")
 	}
-	format := ResFormatExternal
+
+	format := ResFormatExternal // Currently only external resources are supported
 	for i := 0; i < len(state.Resources); i++ {
 		if state.Resources[i].Type == resType && state.Resources[i].Format == format && state.Resources[i].DataStringIndex == pathIdx {
 			return state.Resources[i].Index, nil
@@ -520,7 +793,7 @@ func (state *CompilerState) addResource(resType uint8, pathStr string) (uint8, e
 		return 0, fmt.Errorf("maximum resource limit (%d) exceeded", MaxResources)
 	}
 	idx := uint8(len(state.Resources))
-	entry := ResourceEntry{Type: resType, NameIndex: pathIdx, Format: format, DataStringIndex: pathIdx, Index: idx, CalculatedSize: 4}
+	entry := ResourceEntry{Type: resType, NameIndex: pathIdx, Format: format, DataStringIndex: pathIdx, Index: idx, CalculatedSize: 4} // External resource entry is 4 bytes
 	state.Resources = append(state.Resources, entry)
 	state.HeaderFlags |= FlagHasResources
 	return idx, nil
@@ -553,12 +826,12 @@ func (el *Element) addKrbProperty(propID, valType uint8, data []byte) error {
 	if len(el.KrbProperties) >= MaxProperties {
 		return fmt.Errorf("L%d: maximum KRB properties (%d) exceeded for element '%s'", el.SourceLineNum, MaxProperties, el.SourceElementName)
 	}
-	if len(data) > 255 {
-		return fmt.Errorf("L%d: property data size (%d) exceeds maximum (255) for element '%s', prop ID %d", el.SourceLineNum, len(data), el.SourceElementName, propID)
+	if len(data) > 255 { // KRB Property.Size is 1 byte
+		return fmt.Errorf("L%d: property data size (%d) exceeds maximum (255) for element '%s', prop ID 0x%X", el.SourceLineNum, len(data), el.SourceElementName, propID)
 	}
 	prop := KrbProperty{PropertyID: propID, ValueType: valType, Size: uint8(len(data)), Value: data}
 	el.KrbProperties = append(el.KrbProperties, prop)
-	el.PropertyCount = uint8(len(el.KrbProperties))
+	// el.PropertyCount is finalized in the resolver/writer after all properties are added.
 	return nil
 }
 
@@ -566,7 +839,7 @@ func (el *Element) addKrbProperty(propID, valType uint8, data []byte) error {
 func (state *CompilerState) addKrbStringProperty(el *Element, propID uint8, valueStr string) error {
 	idx, err := state.addString(valueStr)
 	if err != nil {
-		return fmt.Errorf("L%d: failed adding string for property %d: %w", el.SourceLineNum, propID, err)
+		return fmt.Errorf("L%d: failed adding string for property 0x%X ('%s'): %w", el.SourceLineNum, propID, valueStr, err)
 	}
 	return el.addKrbProperty(propID, ValTypeString, []byte{idx})
 }
@@ -575,74 +848,25 @@ func (state *CompilerState) addKrbStringProperty(el *Element, propID uint8, valu
 func (state *CompilerState) addKrbResourceProperty(el *Element, propID, resType uint8, pathStr string) error {
 	idx, err := state.addResource(resType, pathStr)
 	if err != nil {
-		return fmt.Errorf("L%d: failed adding resource for property %d: %w", el.SourceLineNum, propID, err)
+		return fmt.Errorf("L%d: failed adding resource for property 0x%X ('%s'): %w", el.SourceLineNum, propID, pathStr, err)
 	}
 	return el.addKrbProperty(propID, ValTypeResource, []byte{idx})
 }
 
-// addStyleKrbProperty adds a resolved KRB property to a style definition.
-func (style *StyleEntry) addStyleKrbProperty(propID, valType uint8, data []byte) error {
-	if len(style.Properties) >= MaxProperties {
-		return fmt.Errorf("maximum KRB properties (%d) exceeded for style '%s'", MaxProperties, style.SourceName)
-	}
-	if len(data) > 255 {
-		return fmt.Errorf("property data size (%d) exceeds maximum (255) for style '%s', prop ID %d", len(data), style.SourceName, propID)
-	}
-	prop := KrbProperty{PropertyID: propID, ValueType: valType, Size: uint8(len(data)), Value: data}
-	style.Properties = append(style.Properties, prop)
-	return nil
-}
-
-// addStyleKrbStringProperty adds a string property to a style definition.
-func (state *CompilerState) addStyleKrbStringProperty(style *StyleEntry, propID uint8, valueStr string) error {
-	idx, err := state.addString(valueStr)
-	if err != nil {
-		return fmt.Errorf("failed adding string for style property %d in style '%s': %w", propID, style.SourceName, err)
-	}
-	return style.addStyleKrbProperty(propID, ValTypeString, []byte{idx})
-}
-
-// getSourcePropertyValue retrieves the last value string for a given key from an element's source properties.
-func (el *Element) getSourcePropertyValue(key string) (string, bool) {
-	// Search backwards to respect potential overrides during property merging
-	for i := len(el.SourceProperties) - 1; i >= 0; i-- {
-		if el.SourceProperties[i].Key == key {
-			return el.SourceProperties[i].ValueStr, true
-		}
-	}
-	return "", false
-}
-
 // addSourceProperty adds a raw key-value pair from the .kry source to an element. Overwrites if key exists.
 func (el *Element) addSourceProperty(key, value string, lineNum int) error {
-	for i := range el.SourceProperties {
+	for i := range el.SourceProperties { // Check if property key already exists
 		if el.SourceProperties[i].Key == key {
-			el.SourceProperties[i].ValueStr = value
+			el.SourceProperties[i].ValueStr = value // Update value and line number
 			el.SourceProperties[i].LineNum = lineNum
 			return nil
 		}
 	}
+	// Add new property if limit not reached
 	if len(el.SourceProperties) >= MaxProperties {
-		return fmt.Errorf("L%d: maximum source properties (%d) exceeded for element '%s'", lineNum, MaxProperties, el.SourceElementName)
+		return fmt.Errorf("L%d: maximum source properties (%d) exceeded for element '%s' when adding '%s'", lineNum, MaxProperties, el.SourceElementName, key)
 	}
 	prop := SourceProperty{Key: key, ValueStr: value, LineNum: lineNum}
 	el.SourceProperties = append(el.SourceProperties, prop)
-	return nil
-}
-
-// addDefinitionRootProperty adds a raw key-value pair to a component definition's root properties. Overwrites if key exists.
-func (def *ComponentDefinition) addDefinitionRootProperty(key, value string, lineNum int) error {
-	for i := range def.DefinitionRootProperties {
-		if def.DefinitionRootProperties[i].Key == key {
-			def.DefinitionRootProperties[i].ValueStr = value
-			def.DefinitionRootProperties[i].LineNum = lineNum
-			return nil
-		}
-	}
-	if len(def.DefinitionRootProperties) >= MaxProperties {
-		return fmt.Errorf("L%d: maximum root properties (%d) exceeded for component definition '%s'", lineNum, MaxProperties, def.Name)
-	}
-	prop := SourceProperty{Key: key, ValueStr: value, LineNum: lineNum}
-	def.DefinitionRootProperties = append(def.DefinitionRootProperties, prop)
 	return nil
 }
