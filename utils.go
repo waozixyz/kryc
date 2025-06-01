@@ -257,3 +257,46 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// Helper to check if SourceProperties already contains a specific key
+func (style *StyleEntry) SourcePropertiesContainsKey(key string) bool {
+	for _, sp := range style.SourceProperties {
+		if sp.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
+// addKrbProperty adds a resolved KRB property to an element.
+func (el *Element) addKrbProperty(propID, valType uint8, data []byte) error {
+	if len(el.KrbProperties) >= MaxProperties {
+		return fmt.Errorf("L%d: maximum KRB properties (%d) exceeded for element '%s'", el.SourceLineNum, MaxProperties, el.SourceElementName)
+	}
+	if len(data) > 255 { // KRB Property.Size is 1 byte
+		return fmt.Errorf("L%d: property data size (%d) exceeds maximum (255) for element '%s', prop ID 0x%X", el.SourceLineNum, len(data), el.SourceElementName, propID)
+	}
+	prop := KrbProperty{PropertyID: propID, ValueType: valType, Size: uint8(len(data)), Value: data}
+	el.KrbProperties = append(el.KrbProperties, prop)
+	return nil
+}
+
+// addKrbStringProperty adds a string property (looks up/adds string, stores index).
+// This should be a method of CompilerState because it needs to access state.addString
+func (state *CompilerState) addKrbStringProperty(el *Element, propID uint8, valueStr string) error {
+	idx, err := state.addString(valueStr) // addString is a method of *CompilerState
+	if err != nil {
+		return fmt.Errorf("L%d: failed adding string for property 0x%X ('%s'): %w", el.SourceLineNum, propID, valueStr, err)
+	}
+	return el.addKrbProperty(propID, ValTypeString, []byte{idx}) // Calls Element's method
+}
+
+// addKrbResourceProperty adds a resource property (looks up/adds resource, stores index).
+// This should be a method of CompilerState
+func (state *CompilerState) addKrbResourceProperty(el *Element, propID, resType uint8, pathStr string) error {
+	idx, err := state.addResource(resType, pathStr) // addResource is a method of *CompilerState
+	if err != nil {
+		return fmt.Errorf("L%d: failed adding resource for property 0x%X ('%s'): %w", el.SourceLineNum, propID, pathStr, err)
+	}
+	return el.addKrbProperty(propID, ValTypeResource, []byte{idx}) // Calls Element's method
+}

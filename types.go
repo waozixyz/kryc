@@ -218,6 +218,10 @@ type ComponentDefinition struct {
 	// RootElementTemplate     Element // This field is somewhat redundant if DefinitionRootElementIndex is used directly.
 	//                            // It could hold a copy or be a pointer if needed for specific processing.
 	CalculatedSize uint32 // Calculated size of this entire component definition entry in the KRB file
+
+	// Stores pre-calculated offsets for template elements relative to this template's data blob start.
+	// Key is el.SelfIndex of a template element, Value is its offset from the beginning of this template's RootElementTemplate data.
+	InternalTemplateElementOffsets map[int]uint32
 }
 
 // StyleEntry represents a parsed `style "name" { ... }` block.
@@ -307,13 +311,23 @@ type Element struct {
 	ProcessedInPass15 bool // Flag for component expansion and property resolution pass
 }
 
+// VariableDef stores information about a defined variable.
+type VariableDef struct {
+	Value       string // Final, literal value after inter-variable resolution
+	RawValue    string // Value as parsed from KRY, might contain $otherVar
+	DefLine     int    // Line number where this variable was defined (latest if redefined)
+	IsResolving bool   // For cycle detection during inter-variable resolution
+	IsResolved  bool   // True if Value holds the final literal
+}
+
 // CompilerState holds the entire state of the compilation process.
 type CompilerState struct {
 	Elements      []Element // Flat list of all elements (main UI tree instances and component template elements)
 	Strings       []StringEntry
 	Styles        []StyleEntry
 	Resources     []ResourceEntry
-	ComponentDefs []ComponentDefinition // Parsed component definitions
+	ComponentDefs []ComponentDefinition  // Parsed component definitions
+	Variables     map[string]VariableDef // Stores all defined variables
 
 	HasApp      bool   // True if the main UI tree has an `App` root (or implicit via root component)
 	HeaderFlags uint16 // KRB File Header flags, accumulated during compilation

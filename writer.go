@@ -12,46 +12,54 @@ import (
 )
 
 // --- Pass 2: Calculate Offsets & Sizes (KRB v0.4) ---
+
 func (state *CompilerState) calculateOffsetsAndSizes() error {
 	log.Println("Pass 2: Calculating final offsets and sizes (KRB v0.4)...")
-	currentOffset := uint32(KRBHeaderSize) // Start after the main file header (48 bytes for v0.4)
+	currentOffset := uint32(KRBHeaderSize) // Start after the main file header
 
-	// --- 1. Elements Section Size (Main UI Tree ONLY) ---
+	// --- 1. Elements Section Size (Main UI Tree Placeholders and Standard Elements ONLY) ---
 	state.ElementOffset = currentOffset
 	state.TotalElementDataSize = 0
-	mainTreeElementCount := 0
+	mainTreeElementCount := 0 // This count goes into the KRB File Header
 
-	log.Println("DEBUG_CALC_OFFSETS: Elements considered for main UI tree sizing:")
-
+	// log.Println("DEBUG_CALC_OFFSETS: Elements considered for main UI tree sizing:")
 	for i := range state.Elements {
 		el := &state.Elements[i]
-		if el.IsDefinitionRoot { // Skip elements that are part of a component template's definition
+		// Only include elements in the main UI tree (not parts of component definition templates)
+		// for this section's size calculation and Element Count in the header.
+		if el.IsDefinitionRoot {
+			// log.Printf("  -> Skipping Template Element: Idx=%d, Name='%s'", i, el.SourceElementName)
 			continue
 		}
-		mainTreeElementCount++ // Count only main tree elements
 
-		el.AbsoluteOffset = currentOffset // Global offset for this main tree element
+		mainTreeElementCount++
+		el.AbsoluteOffset = currentOffset // Global offset for this main tree element/placeholder
 
-		size := uint32(KRBElementHeaderSize)
+		size := uint32(KRBElementHeaderSize) // Type, ID, PosX/Y, W/H, Layout, StyleID, Counts...
+		// Standard Properties of the placeholder/element
 		for _, prop := range el.KrbProperties {
 			size += 3                 // PropertyID(1) + ValueType(1) + Size(1)
 			size += uint32(prop.Size) // Value data
 		}
+		// Custom Properties of the placeholder (e.g., _componentName, instance props)
 		for _, customProp := range el.KrbCustomProperties {
-			size += 1                        // Key Index
-			size += 1                        // Value Type
-			size += 1                        // Value Size
+			size += 1                       // Key Index
+			size += 1                       // Value Type
+			size += 1                       // Value Size
 			size += uint32(customProp.Size) // Value data
 		}
-		size += uint32(len(el.KrbEvents)) * 2  // EventType(1) + CallbackID(1)
-		size += uint32(len(el.Children)) * 2 // RelativeOffsetToChild(2)
+		// Events on the placeholder/element
+		size += uint32(len(el.KrbEvents)) * 2 // EventType(1) + CallbackID(1)
+		// Children of the placeholder (from KRY usage tag)
+		size += uint32(len(el.Children)) * 2 // RelativeOffsetToChild(2 bytes)
 
 		el.CalculatedSize = size
 		if size < KRBElementHeaderSize {
-			return fmt.Errorf("internal: main element %d ('%s') calculated size %d < header size %d", i, el.SourceElementName, size, KRBElementHeaderSize)
+			return fmt.Errorf("internal: main element/placeholder %d ('%s') calculated size %d < header size %d", i, el.SourceElementName, size, KRBElementHeaderSize)
 		}
 		state.TotalElementDataSize += size
 		currentOffset += size
+		// log.Printf("  -> Sized Main Tree Element: Idx=%d, Name='%s', Size=%d, AbsOffset=%d", i, el.SourceElementName, size, el.AbsoluteOffset)
 	}
 	log.Printf("      Calculated Main UI Tree: %d elements, %d bytes data.", mainTreeElementCount, state.TotalElementDataSize)
 
@@ -61,80 +69,430 @@ func (state *CompilerState) calculateOffsetsAndSizes() error {
 	if (state.HeaderFlags & FlagHasStyles) != 0 {
 		for i := range state.Styles {
 			style := &state.Styles[i]
-			size := uint32(3) // StyleHeader: ID(1) + NameIdx(1) + PropCount(1)
-			for _, prop := range style.Properties {
-				size += 3                  // PropID(1) + ValType(1) + Size(1)
-				size += uint32(prop.Size) // Data
+			// Size calculation for style.CalculatedSize should already be done in style_resolver.go
+			if style.CalculatedSize < 3 { // Smallest possible style block (header only, 0 props)
+				return fmt.Errorf("internal: style %d ('%s') calculated size %d < minimum 3 (was: %d)", i, style.SourceName, style.CalculatedSize, style.CalculatedSize)
 			}
-			style.CalculatedSize = size
-			if size < 3 { // Smallest possible style block (header only, 0 props)
-				return fmt.Errorf("internal: style %d ('%s') calculated size %d < minimum 3", i, style.SourceName, size)
-			}
-			state.TotalStyleDataSize += size
-			currentOffset += size
+			state.TotalStyleDataSize += style.CalculatedSize
+			currentOffset += style.CalculatedSize
 		}
 	}
 	log.Printf("      Calculated Styles: %d styles, %d bytes data.", len(state.Styles), state.TotalStyleDataSize)
-	
+
 	// --- 3. Component Definition Table Section Size ---
 	state.ComponentDefOffset = currentOffset
 	state.TotalComponentDefDataSize = 0
 	if (state.HeaderFlags & FlagHasComponentDefs) != 0 {
 		for cdi := range state.ComponentDefs {
 			def := &state.ComponentDefs[cdi]
-
-			// Ensure component name string is accounted for BEFORE sizing this comp def entry
-			// and crucially before state.Strings is used to size the string table section.
-			_, err := state.addString(def.Name)
-			if err != nil {
-				return fmt.Errorf("CompDef '%s': error adding component name to string table during size calculation: %w", def.Name, err)
-			}
-
 			singleDefEntrySize := uint32(0)
-			singleDefEntrySize += 1 // Name Index (for def.Name, 1 byte for the index itself)
-			singleDefEntrySize += 1 // Property Def Count
 
+			// Name Index of the component definition itself
+			_, err := state.addString(def.Name) // Ensure name is in string table for index lookup
+			if err != nil {
+				return fmt.Errorf("CompDef '%s': error ensuring component name in string table for sizing: %w", def.Name, err)
+			}
+			singleDefEntrySize += 1 // Name Index (1 byte for the string table index)
+			singleDefEntrySize += 1 // Property Def Count (1 byte)
+
+			// Size of Property Definitions part
 			for _, propDef := range def.Properties {
-				// Ensure property definition name string is accounted for
-				_, err := state.addString(propDef.Name)
+				_, err := state.addString(propDef.Name) // Ensure prop def name is in string table
 				if err != nil {
-					return fmt.Errorf("CompDef '%s' prop '%s': error adding property name to string table during size calculation: %w", def.Name, propDef.Name, err)
+					return fmt.Errorf("CompDef '%s' prop '%s': error ensuring prop name in string table for sizing: %w", def.Name, propDef.Name, err)
 				}
+				singleDefEntrySize += 1 // Property Name Index (1 byte)
+				singleDefEntrySize += 1 // Value Type Hint (1 byte)
+				singleDefEntrySize += 1 // Default Value Size (1 byte)
 
-				singleDefEntrySize += 1 // Name Index (for propDef.Name)
-				singleDefEntrySize += 1 // Value Type Hint
-				singleDefEntrySize += 1 // Default Value Size
-
-				// This part correctly handles adding default string values to state.Strings during sizing
+				// Sizing for Default Value Data (ensures strings for defaults are added to string table *now*)
 				_, defaultValDataSize, parseErr := getBinaryDefaultValue(state, propDef.DefaultValueStr, propDef.ValueTypeHint)
 				if parseErr != nil {
-					return fmt.Errorf("compdef '%s' prop '%s': error sizing default value '%s': %w", def.Name, propDef.Name, propDef.DefaultValueStr, parseErr)
+					return fmt.Errorf("compdef '%s' prop '%s': error sizing default value '%s' for KRB: %w", def.Name, propDef.Name, propDef.DefaultValueStr, parseErr)
 				}
 				singleDefEntrySize += uint32(defaultValDataSize)
 			}
 
+			// Size of the Root Element Template part
 			if def.DefinitionRootElementIndex < 0 || def.DefinitionRootElementIndex >= len(state.Elements) {
-				return fmt.Errorf("compdef '%s': invalid root element index %d", def.Name, def.DefinitionRootElementIndex)
+				return fmt.Errorf("compdef '%s': invalid root element index %d for its template", def.Name, def.DefinitionRootElementIndex)
 			}
 
 			templateElementsIndices := getTemplateElementIndices(state, def.DefinitionRootElementIndex)
-			templateTotalDataSize := uint32(0)
-			for _, tplElIdx := range templateElementsIndices {
-				tplEl := &state.Elements[tplElIdx]
+			if len(templateElementsIndices) == 0 {
+				return fmt.Errorf("compdef '%s': root element template is empty or could not be identified", def.Name)
+			}
 
-				// Ensure strings from KrbProperties of template elements were added in Pass 1.5
-				// (No explicit addString calls needed here for KrbProperties themselves, as they store indices/binary data)
+			templateTotalDataSize := uint32(0)
+			// Pre-calculate absolute offsets *within this component definition entry* for template elements
+			// to correctly calculate relative child offsets for the template.
+			currentTemplateElementOffset := uint32(0)      // Relative to start of Root Element Template data
+			templateElementOffsets := make(map[int]uint32) // Map from el.SelfIndex to its offset within this template blob
+
+			for _, tplElIdx := range templateElementsIndices { // Iterate in sorted order
+				tplEl := &state.Elements[tplElIdx]
+				templateElementOffsets[tplEl.SelfIndex] = currentTemplateElementOffset
 
 				tempSize := uint32(KRBElementHeaderSize)
-				for _, prop := range tplEl.KrbProperties {
-					tempSize += 3 // PropertyID(1) + ValueType(1) + Size(1)
-					tempSize += uint32(prop.Size) // Value data
+				for _, prop := range tplEl.KrbProperties { // Standard properties of the template element
+					tempSize += 3 + uint32(prop.Size)
 				}
-				// Note: Custom Properties and Events are typically NOT part of the template's
-				// static definition in KRB. They are applied at instantiation.
-				// So, their counts in the template element header should be 0, and no size added here.
+				// Custom Props and Events should be 0 for template elements as per spec
+				if tplEl.CustomPropCount > 0 || tplEl.EventCount > 0 {
+					log.Printf("Warning: CompDef '%s' template element '%s' (idx %d) has CustomPropCount=%d or EventCount=%d. These should be 0 for templates.", def.Name, tplEl.SourceElementName, tplEl.SelfIndex, tplEl.CustomPropCount, tplEl.EventCount)
+				}
 
-				// ChildCount for template elements refers to children *within the template*.
+				// ChildCount for template elements refers to children *within this template*.
+				// The actual offsets are relative to THIS template's root element.
+				actualTemplateChildCount := 0
+				for _, childRefIdx := range tplEl.SourceChildrenIndices {
+					// Check if this child is part of *this specific template's element list*
+					isChildInThisTemplate := false
+					for _, tei := range templateElementsIndices {
+						if childRefIdx == tei {
+							isChildInThisTemplate = true
+							break
+						}
+					}
+					if isChildInThisTemplate {
+						actualTemplateChildCount++
+					}
+				}
+				tempSize += uint32(actualTemplateChildCount) * 2 // ChildOffset(2 bytes) for each *template child*
+
+				tplEl.CalculatedSize = tempSize // Size of this *one* element within the template definition
+				templateTotalDataSize += tempSize
+				currentTemplateElementOffset += tempSize
+			}
+			// Store these relative offsets for use during writing the template
+			def.InternalTemplateElementOffsets = templateElementOffsets
+
+			singleDefEntrySize += templateTotalDataSize
+			def.CalculatedSize = singleDefEntrySize // Total size for this single component definition entry
+			state.TotalComponentDefDataSize += singleDefEntrySize
+			currentOffset += singleDefEntrySize
+		}
+	}
+	log.Printf("      Calculated Component Defs: %d defs, %d bytes data.", len(state.ComponentDefs), state.TotalComponentDefDataSize)
+
+	// --- 4. Animations Section Size ---
+	state.AnimOffset = currentOffset // Even if 0 anims, offset points to where it would start
+	// No data if 0 anims. state.TotalAnimationDataSize would be 0.
+	log.Printf("      Calculated Animations: 0 anims, 0 bytes data.")
+
+	// --- 5. Strings Section Size ---
+	state.StringOffset = currentOffset
+	stringSectionHeaderSize := uint32(2) // String Count (uint16) - Always present in section
+	state.TotalStringDataSize = 0
+	if len(state.Strings) > 0 { // String data only if strings exist
+		for _, s := range state.Strings {
+			if s.Length > 255 { // KRB String length is 1 byte
+				return fmt.Errorf("string '%s...' (idx %d) length %d exceeds max 255 for KRB", s.Text[:min(len(s.Text), 20)], s.Index, s.Length)
+			}
+			state.TotalStringDataSize += 1 + uint32(s.Length) // LengthByte(1) + UTF-8 Bytes
+		}
+	}
+	currentOffset += stringSectionHeaderSize + state.TotalStringDataSize
+	log.Printf("      Calculated Strings: %d strings, %d bytes data (+%d for count field).", len(state.Strings), state.TotalStringDataSize, stringSectionHeaderSize)
+
+	// --- 6. Resources Section Size ---
+	state.ResourceOffset = currentOffset
+	resourceSectionHeaderSize := uint32(0)
+	state.TotalResourceTableSize = 0
+	if (state.HeaderFlags&FlagHasResources) != 0 && len(state.Resources) > 0 {
+		resourceSectionHeaderSize = 2 // Resource Count (uint16) field is present
+		for i := range state.Resources {
+			res := &state.Resources[i]
+			// res.CalculatedSize should be set during addResource or a dedicated resource sizing pass
+			if res.CalculatedSize == 0 { // Fallback if not pre-calculated
+				if res.Format == ResFormatExternal {
+					res.CalculatedSize = 4
+				} else {
+					return fmt.Errorf("unsupported/unsized resource format %d for resource %d ('%s') during offset calculation", res.Format, i, state.Strings[res.NameIndex].Text)
+				}
+			}
+			state.TotalResourceTableSize += res.CalculatedSize
+		}
+	}
+	currentOffset += resourceSectionHeaderSize + state.TotalResourceTableSize
+	log.Printf("      Calculated Resources: %d resources, %d bytes data (+%d for count field).", len(state.Resources), state.TotalResourceTableSize, resourceSectionHeaderSize)
+
+	state.TotalSize = currentOffset
+	log.Printf("      Total calculated KRB file size: %d bytes\n", state.TotalSize)
+	return nil
+}
+
+// --- Pass 3: Write KRB File (KRB v0.4) ---
+
+func (state *CompilerState) writeKrbFile(filePath string) error {
+	log.Printf("Pass 3: Writing KRB v%d.%d binary to '%s'...\n", KRBVersionMajor, KRBVersionMinor, filePath)
+
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("error creating output file '%s': %w", filePath, err)
+	}
+	defer file.Close()
+	writer := bufio.NewWriter(file)
+
+	// --- Write KRB File Header (48 bytes for v0.4) ---
+	if _, err = writer.WriteString(KRBMagic); err != nil {
+		return fmt.Errorf("write magic: %w", err)
+	}
+	versionField := (uint16(KRBVersionMinor) << 8) | uint16(KRBVersionMajor)
+	if err = writeUint16(writer, versionField); err != nil {
+		return fmt.Errorf("write version: %w", err)
+	}
+	if err = writeUint16(writer, state.HeaderFlags); err != nil {
+		return fmt.Errorf("write flags: %w", err)
+	}
+
+	mainTreeElementCount := 0
+	for i := range state.Elements {
+		if !state.Elements[i].IsDefinitionRoot {
+			mainTreeElementCount++
+		}
+	}
+	if err = writeUint16(writer, uint16(mainTreeElementCount)); err != nil {
+		return fmt.Errorf("write element count: %w", err)
+	}
+	if err = writeUint16(writer, uint16(len(state.Styles))); err != nil {
+		return fmt.Errorf("write style count: %w", err)
+	}
+	if err = writeUint16(writer, uint16(len(state.ComponentDefs))); err != nil {
+		return fmt.Errorf("write component def count: %w", err)
+	}
+	if err = writeUint16(writer, uint16(0)); err != nil {
+		return fmt.Errorf("write animation count: %w", err)
+	} // Animation Count
+	if err = writeUint16(writer, uint16(len(state.Strings))); err != nil {
+		return fmt.Errorf("write string count: %w", err)
+	}
+	if err = writeUint16(writer, uint16(len(state.Resources))); err != nil {
+		return fmt.Errorf("write resource count: %w", err)
+	}
+
+	if err = writeUint32(writer, state.ElementOffset); err != nil {
+		return fmt.Errorf("write element offset: %w", err)
+	}
+	if err = writeUint32(writer, state.StyleOffset); err != nil {
+		return fmt.Errorf("write style offset: %w", err)
+	}
+	if err = writeUint32(writer, state.ComponentDefOffset); err != nil {
+		return fmt.Errorf("write component def offset: %w", err)
+	}
+	if err = writeUint32(writer, state.AnimOffset); err != nil {
+		return fmt.Errorf("write animation offset: %w", err)
+	}
+	if err = writeUint32(writer, state.StringOffset); err != nil {
+		return fmt.Errorf("write string offset: %w", err)
+	}
+	if err = writeUint32(writer, state.ResourceOffset); err != nil {
+		return fmt.Errorf("write resource offset: %w", err)
+	}
+	if err = writeUint32(writer, state.TotalSize); err != nil {
+		return fmt.Errorf("write total size: %w", err)
+	}
+
+	// --- Pad to Element Offset if necessary ---
+	if err = writer.Flush(); err != nil {
+		return fmt.Errorf("flush after header: %w", err)
+	}
+	currentFilePos, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("seek after header flush: %w", err)
+	}
+	paddingNeeded := int64(state.ElementOffset) - currentFilePos
+	if paddingNeeded < 0 {
+		return fmt.Errorf("header size/position mismatch: negative padding %d (pos %d, elemOffset %d)", paddingNeeded, currentFilePos, state.ElementOffset)
+	}
+	if paddingNeeded > 0 {
+		// log.Printf("    Padding KRB header with %d zero bytes.\n", paddingNeeded)
+		if _, err = writer.Write(make([]byte, paddingNeeded)); err != nil {
+			return fmt.Errorf("write header padding: %w", err)
+		}
+	}
+	if err = writer.Flush(); err != nil {
+		return fmt.Errorf("flush after padding: %w", err)
+	} // Ensure padding is written
+	currentFilePos, _ = file.Seek(0, io.SeekCurrent) // Update currentFilePos
+
+	// --- Write Element Blocks (Main UI Tree Placeholders and Standard Elements ONLY) ---
+	log.Printf("    Writing %d main UI tree elements at offset %d (actual: %d)\n", mainTreeElementCount, state.ElementOffset, currentFilePos)
+	if uint32(currentFilePos) != state.ElementOffset {
+		return fmt.Errorf("file pos %d != ElementOffset %d before writing main elements", currentFilePos, state.ElementOffset)
+	}
+
+	firstElementWritten := false
+	for i := range state.Elements {
+		el := &state.Elements[i]
+		if el.IsDefinitionRoot { // Skip elements that are part of a component template
+			continue
+		}
+
+		// Sanity check for App element as the first element if FLAG_HAS_APP is set
+		if !firstElementWritten {
+			if (state.HeaderFlags&FlagHasApp) != 0 && el.Type != ElemTypeApp {
+				return fmt.Errorf("KRB_WRITE_ERROR: FLAG_HAS_APP is set, but the first main tree element is '%s' (Type 0x%02X), not App. Index: %d", el.SourceElementName, el.Type, i)
+			}
+			firstElementWritten = true
+		}
+
+		startPos := currentFilePos
+		if uint32(currentFilePos) != el.AbsoluteOffset { // Ensure calculated absolute offset matches write position
+			return fmt.Errorf("main elem %d ('%s') offset mismatch: current write pos %d != expected abs_offset %d", i, el.SourceElementName, currentFilePos, el.AbsoluteOffset)
+		}
+
+		if err = writeElementHeader(writer, el); err != nil {
+			return fmt.Errorf("main elem %d ('%s') header write: %w", i, el.SourceElementName, err)
+		}
+		if err = writeElementProperties(writer, el.KrbProperties, "StdP"); err != nil {
+			return fmt.Errorf("main elem %d ('%s') std props: %w", i, el.SourceElementName, err)
+		}
+		if err = writeElementCustomProperties(writer, el.KrbCustomProperties, "CstP"); err != nil {
+			return fmt.Errorf("main elem %d ('%s') custom props: %w", i, el.SourceElementName, err)
+		}
+		if err = writeElementEvents(writer, el.KrbEvents); err != nil {
+			return fmt.Errorf("main elem %d ('%s') events: %w", i, el.SourceElementName, err)
+		}
+
+		// Write Child References for this placeholder/standard element
+		// Children are those from the KRY usage tag (for placeholders) or direct KRY children (for standard elements)
+		for cIdx, childInstance := range el.Children { // el.Children should be populated by resolver correctly
+			// childInstance.AbsoluteOffset is the global offset where that child (which could be another placeholder) WILL BE written.
+			// el.AbsoluteOffset is where the current parent `el` header started.
+			relativeOffset := childInstance.AbsoluteOffset - el.AbsoluteOffset
+			if relativeOffset > math.MaxUint16 || (relativeOffset <= 0 && childInstance.AbsoluteOffset != el.AbsoluteOffset) { // relativeOffset can be 0 if child is empty and written immediately after
+				return fmt.Errorf("main elem %d ('%s') child #%d ('%s') invalid relative offset %d (child_abs=%d, parent_abs=%d)", i, el.SourceElementName, cIdx, childInstance.SourceElementName, relativeOffset, childInstance.AbsoluteOffset, el.AbsoluteOffset)
+			}
+			if err = writeUint16(writer, uint16(relativeOffset)); err != nil {
+				return fmt.Errorf("main elem %d child #%d rel offset: %w", i, cIdx, err)
+			}
+		}
+
+		if err = writer.Flush(); err != nil {
+			return fmt.Errorf("main elem %d ('%s') flush: %w", i, el.SourceElementName, err)
+		}
+		currentFilePos, err = file.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return fmt.Errorf("main elem %d ('%s') seek: %w", i, el.SourceElementName, err)
+		}
+
+		bytesWrittenThisElement := uint32(currentFilePos - startPos)
+		if bytesWrittenThisElement != el.CalculatedSize {
+			return fmt.Errorf("main elem %d ('%s') size mismatch: wrote %d, expected %d", i, el.SourceElementName, bytesWrittenThisElement, el.CalculatedSize)
+		}
+	}
+
+	// --- Write Style Blocks ---
+	log.Printf("    Writing %d styles at offset %d (actual: %d)\n", len(state.Styles), state.StyleOffset, currentFilePos)
+	if (state.HeaderFlags & FlagHasStyles) != 0 {
+		if uint32(currentFilePos) != state.StyleOffset {
+			return fmt.Errorf("file pos %d != StyleOffset %d before writing styles", currentFilePos, state.StyleOffset)
+		}
+		for i := range state.Styles {
+			style := &state.Styles[i]
+			startPos := currentFilePos
+			if err = writeUint8(writer, style.ID); err != nil {
+				return fmt.Errorf("style %d ID: %w", i, err)
+			}
+			if err = writeUint8(writer, style.NameIndex); err != nil {
+				return fmt.Errorf("style %d NameIdx: %w", i, err)
+			}
+			if err = writeUint8(writer, uint8(len(style.Properties))); err != nil {
+				return fmt.Errorf("style %d PropCount: %w", i, err)
+			}
+			if err = writeElementProperties(writer, style.Properties, "StyleP"); err != nil {
+				return fmt.Errorf("style %d ('%s') props: %w", i, style.SourceName, err)
+			}
+
+			if err = writer.Flush(); err != nil {
+				return fmt.Errorf("style %d ('%s') flush: %w", i, style.SourceName, err)
+			}
+			currentFilePos, err = file.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return fmt.Errorf("style %d ('%s') seek: %w", i, style.SourceName, err)
+			}
+			bytesWrittenThisStyle := uint32(currentFilePos - startPos)
+			if bytesWrittenThisStyle != style.CalculatedSize {
+				return fmt.Errorf("style %d ('%s') size mismatch: wrote %d, expected %d", i, style.SourceName, bytesWrittenThisStyle, style.CalculatedSize)
+			}
+		}
+	}
+
+	// --- Write Component Definition Table ---
+	log.Printf("    Writing %d component definitions at offset %d (actual: %d)\n", len(state.ComponentDefs), state.ComponentDefOffset, currentFilePos)
+	if (state.HeaderFlags & FlagHasComponentDefs) != 0 {
+		if uint32(currentFilePos) != state.ComponentDefOffset {
+			return fmt.Errorf("file pos %d != ComponentDefOffset %d before writing comp defs", currentFilePos, state.ComponentDefOffset)
+		}
+		for cdi := range state.ComponentDefs {
+			def := &state.ComponentDefs[cdi]
+			startPosDef := currentFilePos // For verifying size of this whole definition entry
+
+			// Write Component Definition Name Index
+			nameIdx, strErr := state.getStringIndex(def.Name) // getStringIndex should be robust
+			if !strErr {
+				return fmt.Errorf("CompDef '%s': name not found in string table during write", def.Name)
+			}
+			if err = writeUint8(writer, nameIdx); err != nil {
+				return fmt.Errorf("CompDef '%s' write name index: %w", def.Name, err)
+			}
+
+			// Write Property Definition Count
+			if err = writeUint8(writer, uint8(len(def.Properties))); err != nil {
+				return fmt.Errorf("CompDef '%s' write prop def count: %w", def.Name, err)
+			}
+
+			// Write each Property Definition
+			for pdi, propDef := range def.Properties {
+				propNameIdx, strErr2 := state.getStringIndex(propDef.Name)
+				if !strErr2 {
+					return fmt.Errorf("CompDef '%s' prop #%d ('%s'): name not found in string table", def.Name, pdi, propDef.Name)
+				}
+				if err = writeUint8(writer, propNameIdx); err != nil {
+					return fmt.Errorf("CompDef '%s' prop '%s' write name idx: %w", def.Name, propDef.Name, err)
+				}
+				if err = writeUint8(writer, propDef.ValueTypeHint); err != nil {
+					return fmt.Errorf("CompDef '%s' prop '%s' write type hint: %w", def.Name, propDef.Name, err)
+				}
+
+				// Get binary data for default value (this ensures strings are added to table if needed by getBinaryDefaultValue)
+				valueBytes, valueSize, parseErr := getBinaryDefaultValue(state, propDef.DefaultValueStr, propDef.ValueTypeHint)
+				if parseErr != nil {
+					return fmt.Errorf("CompDef '%s' prop '%s' default value '%s' (hint %d) parse error for write: %w", def.Name, propDef.Name, propDef.DefaultValueStr, propDef.ValueTypeHint, parseErr)
+				}
+				if err = writeUint8(writer, valueSize); err != nil {
+					return fmt.Errorf("CompDef '%s' prop '%s' write default value size: %w", def.Name, propDef.Name, err)
+				}
+				if valueSize > 0 {
+					if _, err = writer.Write(valueBytes); err != nil {
+						return fmt.Errorf("CompDef '%s' prop '%s' write default value data: %w", def.Name, propDef.Name, err)
+					}
+				}
+			}
+
+			// Write the Root Element Template
+			templateElementsIndices := getTemplateElementIndices(state, def.DefinitionRootElementIndex)
+			if len(templateElementsIndices) == 0 {
+				return fmt.Errorf("CompDef '%s': template is empty, cannot write. RootIdx: %d", def.Name, def.DefinitionRootElementIndex)
+			}
+
+			// The first element in templateElementsIndices is the root of *this* template.
+			// Its pre-calculated offset within def.InternalTemplateElementOffsets should be 0.
+			offsetOfThisTemplateRootWithinBlob := def.InternalTemplateElementOffsets[templateElementsIndices[0]]
+			if offsetOfThisTemplateRootWithinBlob != 0 {
+				log.Printf("Warning: CompDef '%s' root template element (idx %d) has non-zero internal offset %d. This might be unexpected.", def.Name, templateElementsIndices[0], offsetOfThisTemplateRootWithinBlob)
+			}
+
+			for _, tplElIdx := range templateElementsIndices { // Elements are sorted by SelfIndex by getTemplateElementIndices
+				tplEl := &state.Elements[tplElIdx]
+
+				// Write Element Header for this template element
+				// Note: Counts for CustomProps and Events should be 0 for template elements.
+				// ChildCount is for children *within this template*.
+				tplEl.CustomPropCount = 0 // Ensure for template
+				tplEl.EventCount = 0      // Ensure for template
+
 				actualTemplateChildCount := 0
 				for _, childRefIdx := range tplEl.SourceChildrenIndices {
 					isChildInThisTemplate := false
@@ -148,471 +506,66 @@ func (state *CompilerState) calculateOffsetsAndSizes() error {
 						actualTemplateChildCount++
 					}
 				}
-				tempSize += uint32(actualTemplateChildCount) * 2 // ChildOffset(2) for each child in template
+				tplEl.ChildCount = uint8(actualTemplateChildCount)
 
-				tplEl.CalculatedSize = tempSize // This is the size of this *one* element within the template definition
-				templateTotalDataSize += tempSize
-			}
-
-			singleDefEntrySize += templateTotalDataSize
-			def.CalculatedSize = singleDefEntrySize // Total size for this single component definition entry
-			state.TotalComponentDefDataSize += singleDefEntrySize
-			currentOffset += singleDefEntrySize
-		}
-	}
-	log.Printf("      Calculated Component Defs: %d defs, %d bytes data.", len(state.ComponentDefs), state.TotalComponentDefDataSize)
-
-	// --- 4. Animations Section Size ---
-	state.AnimOffset = currentOffset
-	log.Printf("      Calculated Animations: 0 anims, 0 bytes data.")
-
-	// --- 5. Strings Section Size ---
-	state.StringOffset = currentOffset
-	stringSectionHeaderSize := uint32(2) // String Count (uint16) - Always present
-	state.TotalStringDataSize = 0
-	// The KRY spec says "Index 0 may represent an empty/null string."
-	// The addString function ensures state.Strings[0] is the empty string if any strings are added.
-	// If len(state.Strings) is 0 after parsing, your file header will have StringCount 0.
-	// The string section itself would then just be the 2-byte count (0).
-	// The loop calculates TotalStringDataSize based on actual strings.
-	if len(state.Strings) > 0 { // This condition is actually not strictly necessary if stringSectionHeaderSize is always added
-		for _, s := range state.Strings {
-			if s.Length > 255 {
-				return fmt.Errorf("string '%s...' (idx %d) length %d exceeds max 255", s.Text[:min(len(s.Text), 20)], s.Index, s.Length)
-			}
-			state.TotalStringDataSize += 1 + uint32(s.Length) // 1 for length byte + actual string bytes
-		}
-	}
-	currentOffset += stringSectionHeaderSize + state.TotalStringDataSize
-	log.Printf("      Calculated Strings: %d strings, %d bytes data (+%d for count).", len(state.Strings), state.TotalStringDataSize, stringSectionHeaderSize)
-
-	// --- 6. Resources Section Size ---
-	state.ResourceOffset = currentOffset
-	resourceSectionHeaderSize := uint32(0) // Initialize to 0
-	state.TotalResourceTableSize = 0
-
-	if (state.HeaderFlags & FlagHasResources) != 0 { // Check if the flag IS set (meaning resources exist)
-		resourceSectionHeaderSize = 2 // Resource Count (uint16) only if there are resources
-		for i := range state.Resources {
-			res := &state.Resources[i]
-			resSize := uint32(0)
-			if res.Format == ResFormatExternal {
-				resSize = 4 // Type(1) + NameIndex(1) + Format(1) + DataStringIndex(1)
-			} else if res.Format == ResFormatInline {
-				// Properly calculate inline resource size if you implement it
-				// resSize = 3 + uint32(len(res.InlineData)) // 3 for Type,NameIdx,Format + 2 for Size + data
-				return fmt.Errorf("unsupported resource format %d for resource %d during size calculation", res.Format, i)
-			} else {
-				return fmt.Errorf("unknown resource format %d for resource %d during size calculation", res.Format, i)
-			}
-			res.CalculatedSize = resSize
-			state.TotalResourceTableSize += resSize
-		}
-	}
-	// Always add the calculated sizes to currentOffset. If no resources, both will be 0.
-	currentOffset += resourceSectionHeaderSize + state.TotalResourceTableSize
-	log.Printf("      Calculated Resources: %d resources, %d bytes data (+%d for count).", len(state.Resources), state.TotalResourceTableSize, resourceSectionHeaderSize)
-
-	state.TotalSize = currentOffset
-
-	log.Printf("      Total calculated KRB file size: %d bytes\n", state.TotalSize)
-	return nil
-}
-
-// --- Pass 3: Write KRB File (KRB v0.4) ---
-func (state *CompilerState) writeKrbFile(filePath string) error {
-	log.Printf("Pass 3: Writing KRB v%d.%d binary to '%s'...\n", KRBVersionMajor, KRBVersionMinor, filePath)
-
-	file, err := os.Create(filePath)
-	if err != nil {
-		return fmt.Errorf("create output file '%s': %w", filePath, err)
-	}
-	defer file.Close()
-	writer := bufio.NewWriter(file)
-
-	// --- Write KRB File Header (48 bytes for v0.4) ---
-	_, err = writer.WriteString(KRBMagic)
-	if err != nil {
-		return fmt.Errorf("write magic: %w", err)
-	}
-
-	versionField := (uint16(KRBVersionMinor) << 8) | uint16(KRBVersionMajor)
-	err = writeUint16(writer, versionField)
-	if err != nil {
-		return fmt.Errorf("write version: %w", err)
-	}
-
-	err = writeUint16(writer, state.HeaderFlags)
-	if err != nil {
-		return fmt.Errorf("write flags: %w", err)
-	}
-
-	mainTreeElementCount := 0
-	for i := range state.Elements {
-		if !state.Elements[i].IsDefinitionRoot {
-			mainTreeElementCount++
-		}
-	}
-
-	err = writeUint16(writer, uint16(mainTreeElementCount))
-	if err != nil {
-		return fmt.Errorf("write element count: %w", err)
-	}
-	err = writeUint16(writer, uint16(len(state.Styles)))
-	if err != nil {
-		return fmt.Errorf("write style count: %w", err)
-	}
-	err = writeUint16(writer, uint16(len(state.ComponentDefs)))
-	if err != nil {
-		return fmt.Errorf("write component def count: %w", err)
-	}
-	err = writeUint16(writer, uint16(0)) // Animation Count
-	if err != nil {
-		return fmt.Errorf("write animation count: %w", err)
-	}
-	err = writeUint16(writer, uint16(len(state.Strings)))
-	if err != nil {
-		return fmt.Errorf("write string count: %w", err)
-	}
-	err = writeUint16(writer, uint16(len(state.Resources)))
-	if err != nil {
-		return fmt.Errorf("write resource count: %w", err)
-	}
-
-	err = writeUint32(writer, state.ElementOffset)
-	if err != nil {
-		return fmt.Errorf("write element offset: %w", err)
-	}
-	err = writeUint32(writer, state.StyleOffset)
-	if err != nil {
-		return fmt.Errorf("write style offset: %w", err)
-	}
-	err = writeUint32(writer, state.ComponentDefOffset)
-	if err != nil {
-		return fmt.Errorf("write component def offset: %w", err)
-	}
-	err = writeUint32(writer, state.AnimOffset)
-	if err != nil {
-		return fmt.Errorf("write animation offset: %w", err)
-	}
-	err = writeUint32(writer, state.StringOffset)
-	if err != nil {
-		return fmt.Errorf("write string offset: %w", err)
-	}
-	err = writeUint32(writer, state.ResourceOffset)
-	if err != nil {
-		return fmt.Errorf("write resource offset: %w", err)
-	}
-	err = writeUint32(writer, state.TotalSize)
-	if err != nil {
-		return fmt.Errorf("write total size: %w", err)
-	}
-
-	// --- Pad to Element Offset if necessary ---
-	err = writer.Flush()
-	if err != nil {
-		return fmt.Errorf("flush after header: %w", err)
-	}
-	currentFilePos, err := file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return fmt.Errorf("seek after header flush: %w", err)
-	}
-	paddingNeeded := int64(state.ElementOffset) - currentFilePos
-	if paddingNeeded < 0 {
-		return fmt.Errorf("header size/position mismatch: negative padding %d (pos %d, elemOffset %d)", paddingNeeded, currentFilePos, state.ElementOffset)
-	}
-	if paddingNeeded > 0 {
-		log.Printf("    Padding KRB header with %d zero bytes.\n", paddingNeeded)
-		_, err = writer.Write(make([]byte, paddingNeeded))
-		if err != nil {
-			return fmt.Errorf("write header padding: %w", err)
-		}
-	}
-	err = writer.Flush()
-	if err != nil {
-		return fmt.Errorf("flush after padding: %w", err)
-	}
-	currentFilePos, err = file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return fmt.Errorf("seek after padding flush: %w", err)
-	}
-
-	// --- Write Element Blocks (Main UI Tree ONLY) ---
-	log.Printf("    Writing %d main UI tree elements at offset %d (actual: %d)\n", mainTreeElementCount, state.ElementOffset, currentFilePos)
-	if uint32(currentFilePos) != state.ElementOffset {
-		return fmt.Errorf("file pos %d != ElementOffset %d before main elements", currentFilePos, state.ElementOffset)
-	}
-	
-	firstElementWritten := false // Add a flag
-	for i := range state.Elements {
-		el := &state.Elements[i]
-		if el.IsDefinitionRoot { // Skip template elements
-			continue
-		}
-
-		if !firstElementWritten {
-			if (state.HeaderFlags&FlagHasApp) != 0 && el.Type != ElemTypeApp {
-                // Corrected Errorf:
-                return fmt.Errorf("KRB_WRITE_ERROR: FLAG_HAS_APP is set, but the first main tree element to be written is '%s' (Type 0x%02X), not App (Type 0x%02X). Index in state.Elements: %d", el.SourceElementName, el.Type, ElemTypeApp, i)
-            }
-			firstElementWritten = true
-		}
-
-		startPos := currentFilePos
-		if uint32(currentFilePos) != el.AbsoluteOffset {
-			return fmt.Errorf("main elem %d ('%s') offset mismatch: current %d != expected %d", i, el.SourceElementName, currentFilePos, el.AbsoluteOffset)
-		}
-
-		err = writeElementHeader(writer, el)
-		if err != nil {
-			return fmt.Errorf("main elem %d ('%s') header write: %w", i, el.SourceElementName, err)
-		}
-		err = writeElementProperties(writer, el.KrbProperties, "StdP")
-		if err != nil {
-			return fmt.Errorf("main elem %d ('%s') std props write: %w", i, el.SourceElementName, err)
-		}
-		err = writeElementCustomProperties(writer, el.KrbCustomProperties, "CstP")
-		if err != nil {
-			return fmt.Errorf("main elem %d ('%s') custom props write: %w", i, el.SourceElementName, err)
-		}
-		err = writeElementEvents(writer, el.KrbEvents)
-		if err != nil {
-			return fmt.Errorf("main elem %d ('%s') events write: %w", i, el.SourceElementName, err)
-		}
-
-		for cIdx, child := range el.Children {
-			relativeOffset := child.AbsoluteOffset - el.AbsoluteOffset
-			if relativeOffset > math.MaxUint16 || (relativeOffset <= 0 && child.AbsoluteOffset != el.AbsoluteOffset) {
-				return fmt.Errorf("main elem %d ('%s') child #%d ('%s') invalid rel offset %d (child_abs=%d, parent_abs=%d)", i, el.SourceElementName, cIdx, child.SourceElementName, relativeOffset, child.AbsoluteOffset, el.AbsoluteOffset)
-			}
-			err = writeUint16(writer, uint16(relativeOffset))
-			if err != nil {
-				return fmt.Errorf("main elem %d child #%d rel offset write: %w", i, cIdx, err)
-			}
-		}
-
-		err = writer.Flush()
-		if err != nil {
-			return fmt.Errorf("main elem %d ('%s') flush: %w", i, el.SourceElementName, err)
-		}
-		currentFilePos, err = file.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return fmt.Errorf("main elem %d ('%s') seek after write: %w", i, el.SourceElementName, err)
-		}
-
-		bytesWritten := uint32(currentFilePos - startPos)
-		if bytesWritten != el.CalculatedSize {
-			return fmt.Errorf("main elem %d ('%s') size mismatch: wrote %d, expected %d", i, el.SourceElementName, bytesWritten, el.CalculatedSize)
-		}
-	}
-
-	// --- Write Style Blocks ---
-
-	log.Println("DEBUG_WRITER: Elements considered for main UI tree output:")
-	log.Printf("DEBUG_WRITER: state.HasApp = %t, (state.HeaderFlags & FlagHasApp) != 0 is %t", state.HasApp, (state.HeaderFlags&FlagHasApp) != 0)
-	actualMainTreeElementsCountedInWriter := 0
-	for elemIdxLoop := range state.Elements {
-		loopEl := &state.Elements[elemIdxLoop]
-		if !loopEl.IsDefinitionRoot {
-			log.Printf("  -> Main Tree Element Candidate: IdxInState=%d, Name='%s', Type=0x%02X, IsDefRoot=%t, SourceLine=%d, ParentIdx=%d, CalculatedSize=%d, AbsOffset=%d",
-				elemIdxLoop,
-				loopEl.SourceElementName,
-				loopEl.Type,
-				loopEl.IsDefinitionRoot,
-				loopEl.SourceLineNum,
-				loopEl.ParentIndex,
-				loopEl.CalculatedSize,
-				loopEl.AbsoluteOffset)
-			actualMainTreeElementsCountedInWriter++
-		}
-	}
-	log.Printf("DEBUG_WRITER: Total candidates identified by writer loop: %d. Header's mainTreeElementCount: %d", actualMainTreeElementsCountedInWriter, mainTreeElementCount)
-	// Check if mainTreeElementCount (used in header) matches actualMainTreeElementsCountedInWriter (that will be looped)
-	if uint16(actualMainTreeElementsCountedInWriter) != uint16(mainTreeElementCount) {
-		 log.Printf("DEBUG_WRITER_ERROR: Mismatch between mainTreeElementCount in header (%d) and elements writer will loop over (%d)!", mainTreeElementCount, actualMainTreeElementsCountedInWriter)
-	}
-
-	log.Printf("    Writing %d styles at offset %d (actual: %d)\n", len(state.Styles), state.StyleOffset, currentFilePos)
-	if (state.HeaderFlags & FlagHasStyles) != 0 {
-		if uint32(currentFilePos) != state.StyleOffset {
-			return fmt.Errorf("file pos %d != StyleOffset %d before styles", currentFilePos, state.StyleOffset)
-		}
-		for i := range state.Styles {
-			style := &state.Styles[i]
-			startPos := currentFilePos
-			err = writeUint8(writer, style.ID)
-			if err != nil { return fmt.Errorf("style %d ID: %w", i, err) }
-			err = writeUint8(writer, style.NameIndex)
-			if err != nil { return fmt.Errorf("style %d NameIdx: %w", i, err) }
-			err = writeUint8(writer, uint8(len(style.Properties)))
-			if err != nil { return fmt.Errorf("style %d PropCount: %w", i, err) }
-			err = writeElementProperties(writer, style.Properties, "StyleP")
-			if err != nil { return fmt.Errorf("style %d ('%s') props: %w", i, style.SourceName, err) }
-
-			err = writer.Flush()
-			if err != nil { return fmt.Errorf("style %d ('%s') flush: %w", i, style.SourceName, err) }
-			currentFilePos, err = file.Seek(0, io.SeekCurrent)
-			if err != nil { return fmt.Errorf("style %d ('%s') seek: %w", i, style.SourceName, err) }
-			bytesWritten := uint32(currentFilePos - startPos)
-			if bytesWritten != style.CalculatedSize {
-				return fmt.Errorf("style %d ('%s') size mismatch: wrote %d, expected %d", i, style.SourceName, bytesWritten, style.CalculatedSize)
-			}
-		}
-	}
-
-	// --- Write Component Definition Table ---
-	log.Printf("    Writing %d component definitions at offset %d (actual: %d)\n", len(state.ComponentDefs), state.ComponentDefOffset, currentFilePos)
-	if (state.HeaderFlags & FlagHasComponentDefs) != 0 {
-		if uint32(currentFilePos) != state.ComponentDefOffset {
-			return fmt.Errorf("file pos %d != ComponentDefOffset %d before comp defs", currentFilePos, state.ComponentDefOffset)
-		}
-		for cdi := range state.ComponentDefs {
-			def := &state.ComponentDefs[cdi]
-			startPosDef := currentFilePos
-
-			nameIdx, strErr := state.addString(def.Name)
-			if strErr != nil {
-				return fmt.Errorf("CompDef '%s' name string error: %w", def.Name, strErr)
-			}
-			err = writeUint8(writer, nameIdx)
-			if err != nil {
-				return fmt.Errorf("CompDef '%s' write name index: %w", def.Name, err)
-			}
-
-			err = writeUint8(writer, uint8(len(def.Properties)))
-			if err != nil {
-				return fmt.Errorf("CompDef '%s' write prop def count: %w", def.Name, err)
-			}
-
-			for pdi, propDef := range def.Properties {
-				propNameIdx, strErr2 := state.addString(propDef.Name)
-				if strErr2 != nil {
-					return fmt.Errorf("CompDef '%s' prop #%d ('%s') name string error: %w", def.Name, pdi, propDef.Name, strErr2)
+				if err = writeElementHeader(writer, tplEl); err != nil {
+					return fmt.Errorf("TplElem '%s' (in CompDef '%s') header: %w", tplEl.SourceElementName, def.Name, err)
 				}
-				err = writeUint8(writer, propNameIdx)
-				if err != nil {
-					return fmt.Errorf("CompDef '%s' prop '%s' write name index: %w", def.Name, propDef.Name, err)
+				if err = writeElementProperties(writer, tplEl.KrbProperties, fmt.Sprintf("TplElem '%s' Prop", tplEl.SourceElementName)); err != nil {
+					return err
 				}
-				err = writeUint8(writer, propDef.ValueTypeHint)
-				if err != nil {
-					return fmt.Errorf("CompDef '%s' prop '%s' write type hint: %w", def.Name, propDef.Name, err)
-				}
-
-				valueBytes, _, valueSize, parseErr := parseKryValueToKrbBytes(state, propDef.DefaultValueStr, propDef.ValueTypeHint, "compDefDefaultWrite", lineNumForError(def.DefinitionStartLine, pdi))
-				if parseErr != nil {
-					return fmt.Errorf("CompDef '%s' prop '%s' default value '%s' (hint %d): %w", def.Name, propDef.Name, propDef.DefaultValueStr, propDef.ValueTypeHint, parseErr)
-				}
-				err = writeUint8(writer, valueSize) // DefaultValueSize
-				if err != nil {
-					return fmt.Errorf("CompDef '%s' prop '%s' write default value size: %w", def.Name, propDef.Name, err)
-				}
-				if valueSize > 0 {
-					_, err = writer.Write(valueBytes)
-					if err != nil {
-						return fmt.Errorf("CompDef '%s' prop '%s' write default value data (size %d): %w", def.Name, propDef.Name, valueSize, err)
-					}
-				}
-			}
-
-			templateRootEl := &state.Elements[def.DefinitionRootElementIndex]
-			templateElementsIndices := getTemplateElementIndices(state, def.DefinitionRootElementIndex)
-
-			// The file offset where the header of this specific template's root element begins.
-			// All child offsets within this template definition will be relative to this.
-			// Note: writer.Buffered() gives bytes in buffer, not yet written to file.
-			// We need the position *after* the component def header and property defs are flushed.
-			err = writer.Flush()
-			if err != nil { return fmt.Errorf("CompDef '%s' flush before template root: %w", def.Name, err) }
-			_, err := file.Seek(0, io.SeekCurrent)
-			if err != nil { return fmt.Errorf("CompDef '%s' seek for template root offset: %w", def.Name, err) }
-
-
-			for _, tplElIdx := range templateElementsIndices {
-				tplEl := &state.Elements[tplElIdx]
-
-				// Write Element Header for this template element
-				err = writeUint8(writer, tplEl.Type)
-				if err != nil { return fmt.Errorf("TplElem '%s' Type: %w", tplEl.SourceElementName, err)}
-				err = writeUint8(writer, tplEl.IDStringIndex)
-				if err != nil { return fmt.Errorf("TplElem '%s' IDStringIndex: %w", tplEl.SourceElementName, err) }
-				err = writeUint16(writer, tplEl.PosX)
-				if err != nil { return fmt.Errorf("TplElem '%s' PosX: %w", tplEl.SourceElementName, err)}
-				err = writeUint16(writer, tplEl.PosY)
-				if err != nil { return fmt.Errorf("TplElem '%s' PosY: %w", tplEl.SourceElementName, err)}
-				err = writeUint16(writer, tplEl.Width)
-				if err != nil { return fmt.Errorf("TplElem '%s' Width: %w", tplEl.SourceElementName, err)}
-				err = writeUint16(writer, tplEl.Height)
-				if err != nil { return fmt.Errorf("TplElem '%s' Height: %w", tplEl.SourceElementName, err)}
-				err = writeUint8(writer, tplEl.Layout)
-				if err != nil { return fmt.Errorf("TplElem '%s' Layout: %w", tplEl.SourceElementName, err)}
-				err = writeUint8(writer, tplEl.StyleID)
-				if err != nil { return fmt.Errorf("TplElem '%s' StyleID: %w", tplEl.SourceElementName, err)}
-				err = writeUint8(writer, uint8(len(tplEl.KrbProperties)))
-				if err != nil { return fmt.Errorf("TplElem '%s' PropertyCount: %w", tplEl.SourceElementName, err)}
-
-				actualTemplateChildCount := 0
-				for _, childRefIdx := range tplEl.SourceChildrenIndices {
-					isChildInThisTemplate := false
-					for _, tei := range templateElementsIndices { if childRefIdx == tei { isChildInThisTemplate = true; break } }
-					if isChildInThisTemplate { actualTemplateChildCount++ }
-				}
-				err = writeUint8(writer, uint8(actualTemplateChildCount))
-				if err != nil { return fmt.Errorf("TplElem '%s' ChildCount: %w", tplEl.SourceElementName, err)}
-				err = writeUint8(writer, 0) // Event Count
-				if err != nil { return fmt.Errorf("TplElem '%s' EventCount: %w", tplEl.SourceElementName, err)}
-				err = writeUint8(writer, 0) // Animation Count
-				if err != nil { return fmt.Errorf("TplElem '%s' AnimationCount: %w", tplEl.SourceElementName, err)}
-				err = writeUint8(writer, 0) // Custom Prop Count
-				if err != nil { return fmt.Errorf("TplElem '%s' CustomPropCount: %w", tplEl.SourceElementName, err)}
-
-				// Write Standard Properties of the template element
-				err = writeElementProperties(writer, tplEl.KrbProperties, fmt.Sprintf("TplElem '%s' Prop", tplEl.SourceElementName))
-				if err != nil { return err }
+				// No custom props or events for template elements.
 
 				// Write Child Relative Offsets for template children
-				for childNum, childRefIdx := range tplEl.SourceChildrenIndices {
+				// These offsets are relative to the start of *this template's root element header*
+				// within this specific Component Definition Entry.
+				for childNum, childIdxInState := range tplEl.SourceChildrenIndices {
 					isChildInThisTemplate := false
-					for _, tei := range templateElementsIndices { if childRefIdx == tei { isChildInThisTemplate = true; break } }
-					if !isChildInThisTemplate { continue }
+					for _, tei := range templateElementsIndices {
+						if childIdxInState == tei {
+							isChildInThisTemplate = true
+							break
+						}
+					}
+					if !isChildInThisTemplate {
+						continue
+					} // Skip children not part of this template definition
 
-					childEl := &state.Elements[childRefIdx]
-					
-					// The offset written must be:
-					// (Absolute file offset where childEl's header will start for *this def entry*) - (Absolute file offset where templateRootEl's header *started* for *this def entry*)
-					// This requires pre-calculating the layout of the template elements within the definition entry.
-					// `childEl.AbsoluteOffset` and `templateRootEl.AbsoluteOffset` are their global positions if all elements were flat.
-					// The difference `childEl.AbsoluteOffset - templateRootEl.AbsoluteOffset` should represent the correct relative
-					// offset if the template elements are written sequentially as collected by `getTemplateElementIndices`.
+					childElInTemplate := &state.Elements[childIdxInState]
 
-					var offsetRelativeToTemplateRoot uint32
-					if childEl.AbsoluteOffset >= templateRootEl.AbsoluteOffset {
-						offsetRelativeToTemplateRoot = childEl.AbsoluteOffset - templateRootEl.AbsoluteOffset
-					} else {
-						return fmt.Errorf("CompDef '%s', TplParent '%s': template child '%s' (abs %d) appears before template root '%s' (abs %d)",
-							def.Name, tplEl.SourceElementName, childEl.SourceElementName, childEl.AbsoluteOffset, templateRootEl.SourceElementName, templateRootEl.AbsoluteOffset)
+					// Get the pre-calculated offset of this child *within the template blob*
+					offsetOfChildWithinBlob, okChild := def.InternalTemplateElementOffsets[childElInTemplate.SelfIndex]
+					if !okChild {
+						return fmt.Errorf("CompDef '%s', TplParent '%s': offset for template child '%s' (idx %d) not found in precalculated map", def.Name, tplEl.SourceElementName, childElInTemplate.SourceElementName, childElInTemplate.SelfIndex)
 					}
 
-					if offsetRelativeToTemplateRoot > math.MaxUint16 {
-						return fmt.Errorf("CompDef '%s', TplParent '%s': template child '%s' relative offset %d to template root exceeds uint16 max",
-							def.Name, tplEl.SourceElementName, childEl.SourceElementName, offsetRelativeToTemplateRoot)
+					// The offset written is from the start of the *current tplEl's header* to the start of the *childElInTemplate's header*
+					// *within the context of this template's sequential write*.
+					// currentTplElOffsetWithinBlob is the offset of tplEl itself relative to the start of the template blob.
+					currentTplElOffsetWithinBlob := def.InternalTemplateElementOffsets[tplEl.SelfIndex]
+					relativeOffset := offsetOfChildWithinBlob - currentTplElOffsetWithinBlob
+
+					if relativeOffset > math.MaxUint16 || (relativeOffset <= 0 && offsetOfChildWithinBlob != currentTplElOffsetWithinBlob) {
+						return fmt.Errorf("CompDef '%s', TplParent '%s': template child '%s' invalid relative offset %d (child_blob_offset=%d, parent_blob_offset=%d)",
+							def.Name, tplEl.SourceElementName, childElInTemplate.SourceElementName, relativeOffset, offsetOfChildWithinBlob, currentTplElOffsetWithinBlob)
 					}
-					err = writeUint16(writer, uint16(offsetRelativeToTemplateRoot))
-					if err != nil {
-						return fmt.Errorf("CompDef '%s', TplParent '%s' child #%d ('%s') write rel offset: %w", def.Name, tplEl.SourceElementName, childNum, childEl.SourceElementName, err)
+					if err = writeUint16(writer, uint16(relativeOffset)); err != nil {
+						return fmt.Errorf("CompDef '%s', TplParent '%s' child #%d ('%s') write rel offset: %w", def.Name, tplEl.SourceElementName, childNum, childElInTemplate.SourceElementName, err)
 					}
 				}
 			}
 
-			err = writer.Flush()
-			if err != nil {
-				return fmt.Errorf("CompDef '%s' flush after template write: %w", def.Name, err)
+			if err = writer.Flush(); err != nil {
+				return fmt.Errorf("CompDef '%s' flush after template: %w", def.Name, err)
 			}
 			currentFilePos, err = file.Seek(0, io.SeekCurrent)
-			if err != nil { return fmt.Errorf("CompDef '%s' seek after template write: %w", def.Name, err) }
-			
-			bytesWrittenForDef := uint32(currentFilePos - startPosDef)
-			if bytesWrittenForDef != def.CalculatedSize {
-				log.Printf("Warn: CompDef '%s' size mismatch: wrote %d, expected %d. Review CalculatedSize for component definitions.", def.Name, bytesWrittenForDef, def.CalculatedSize)
+			if err != nil {
+				return fmt.Errorf("CompDef '%s' seek after template: %w", def.Name, err)
+			}
+
+			bytesWrittenForThisDef := uint32(currentFilePos - startPosDef)
+			if bytesWrittenForThisDef != def.CalculatedSize {
+				log.Printf("Warning: CompDef '%s' size mismatch: wrote %d, expected %d. Review CalculatedSize logic.", def.Name, bytesWrittenForThisDef, def.CalculatedSize)
 			}
 		}
 	}
@@ -620,122 +573,81 @@ func (state *CompilerState) writeKrbFile(filePath string) error {
 	// --- Write Animation Table Section ---
 	log.Printf("    Writing 0 animations at offset %d (actual: %d)\n", state.AnimOffset, currentFilePos)
 	if uint32(currentFilePos) != state.AnimOffset {
+		// Allow if no anims and it's where the next section (strings) starts
 		if !(state.AnimOffset == state.StringOffset && (state.HeaderFlags&FlagHasAnimations) == 0) {
-			return fmt.Errorf("file pos %d != AnimOffset %d", currentFilePos, state.AnimOffset)
+			return fmt.Errorf("file pos %d != AnimOffset %d before writing (empty) animation section", currentFilePos, state.AnimOffset)
 		}
 	}
+	// No data to write if Animation Count is 0.
 
 	// --- Write String Table Section ---
 	log.Printf("    Writing %d strings at offset %d (actual: %d)\n", len(state.Strings), state.StringOffset, currentFilePos)
 	if uint32(currentFilePos) != state.StringOffset {
-		return fmt.Errorf("file pos %d != StringOffset %d", currentFilePos, state.StringOffset)
+		return fmt.Errorf("file pos %d != StringOffset %d before writing strings", currentFilePos, state.StringOffset)
 	}
-	err = writeUint16(writer, uint16(len(state.Strings)))
-	if err != nil {
+	if err = writeUint16(writer, uint16(len(state.Strings))); err != nil {
 		return fmt.Errorf("write string count: %w", err)
-	}
+	} // String Count field
 	for i := range state.Strings {
 		s := &state.Strings[i]
-		err = writeUint8(writer, uint8(s.Length))
-		if err != nil {
-			return fmt.Errorf("Str%d write len: %w", i, err)
-		}
+		if err = writeUint8(writer, uint8(s.Length)); err != nil {
+			return fmt.Errorf("Str%d ('%s') write len: %w", i, s.Text, err)
+		} // Length byte
 		if s.Length > 0 {
-			_, err = writer.WriteString(s.Text)
-			if err != nil {
-				return fmt.Errorf("Str%d write text: %w", i, err)
+			if _, err = writer.WriteString(s.Text); err != nil {
+				return fmt.Errorf("Str%d ('%s') write text: %w", i, s.Text, err)
 			}
 		}
 	}
-	err = writer.Flush()
-	if err != nil {
+	if err = writer.Flush(); err != nil {
 		return fmt.Errorf("flush strings: %w", err)
 	}
 	currentFilePos, err = file.Seek(0, io.SeekCurrent)
-	if err != nil { return fmt.Errorf("seek after strings: %w", err) }
+	if err != nil {
+		return fmt.Errorf("seek after strings: %w", err)
+	}
+
 	// --- Write Resource Table Section ---
 	log.Printf("    Writing %d resources at offset %d (actual: %d)\n", len(state.Resources), state.ResourceOffset, currentFilePos)
-
-	if (state.HeaderFlags & FlagHasResources) != 0 {
-		// This case means len(state.Resources) > 0 and the FlagHasResources is set.
-		// We expect currentFilePos to exactly match where the ResourceOffset was calculated to be.
+	if (state.HeaderFlags&FlagHasResources) != 0 && len(state.Resources) > 0 {
 		if uint32(currentFilePos) != state.ResourceOffset {
-			return fmt.Errorf("file position %d != ResourceOffset %d before writing resource section header (resources expected)", currentFilePos, state.ResourceOffset)
+			return fmt.Errorf("file pos %d != ResourceOffset %d before writing resource section header", currentFilePos, state.ResourceOffset)
 		}
-
-		// Write Resource Count
-		err = writeUint16(writer, uint16(len(state.Resources)))
-		if err != nil {
+		if err = writeUint16(writer, uint16(len(state.Resources))); err != nil {
 			return fmt.Errorf("write resource count: %w", err)
-		}
-
-		// Write each resource entry
+		} // Resource Count field
 		for _, r := range state.Resources {
-			err = writeUint8(writer, r.Type)
-			if err != nil {
-				return fmt.Errorf("write resource type: %w", err)
+			if err = writeUint8(writer, r.Type); err != nil {
+				return fmt.Errorf("write res type: %w", err)
 			}
-			err = writeUint8(writer, r.NameIndex)
-			if err != nil {
-				return fmt.Errorf("write resource name index: %w", err)
+			if err = writeUint8(writer, r.NameIndex); err != nil {
+				return fmt.Errorf("write res name idx: %w", err)
 			}
-			err = writeUint8(writer, r.Format)
-			if err != nil {
-				return fmt.Errorf("write resource format: %w", err)
+			if err = writeUint8(writer, r.Format); err != nil {
+				return fmt.Errorf("write res format: %w", err)
 			}
 			if r.Format == ResFormatExternal {
-				err = writeUint8(writer, r.DataStringIndex)
-				if err != nil {
-					return fmt.Errorf("write resource data string index: %w", err)
+				if err = writeUint8(writer, r.DataStringIndex); err != nil {
+					return fmt.Errorf("write res data str idx: %w", err)
 				}
 			} else {
-				return fmt.Errorf("unsupported resource format %d encountered during write", r.Format)
+				return fmt.Errorf("unsupported resource format %d during write for resource '%s'", r.Format, state.Strings[r.NameIndex].Text)
 			}
 		}
-
-		err = writer.Flush()
-		if err != nil {
-			return fmt.Errorf("flush after writing resources: %w", err)
-		}
-		currentFilePos, err = file.Seek(0, io.SeekCurrent) // Update currentFilePos
-		if err != nil {
-			return fmt.Errorf("seek after writing resources: %w", err)
-		}
-	} else {
-		// This case means FlagHasResources is NOT set, and len(state.Resources) should be 0.
-		// The currentFilePos (which is after the previous section, e.g., Strings)
-		// should be exactly where the (empty) Resource section was calculated to start.
+	} else { // No resources or flag not set
 		if uint32(currentFilePos) != state.ResourceOffset {
-			// If this condition is met, it means the previous section (Strings) did not end
-			// where calculateOffsetsAndSizes expected it to end. The discrepancy lies there.
-			return fmt.Errorf("file position %d != ResourceOffset %d (no resources flag; indicates previous section ended at an unexpected position)", currentFilePos, state.ResourceOffset)
+			return fmt.Errorf("file pos %d != ResourceOffset %d (no resources expected, indicates prev section end error)", currentFilePos, state.ResourceOffset)
 		}
+		// If ResourceOffset is different from TotalSize here, it means TotalSize implies more (empty) sections.
+		// This is fine as long as currentFilePos matches where the (empty) resource section starts.
+	}
+	if err = writer.Flush(); err != nil {
+		return fmt.Errorf("flush after resources (or empty res section): %w", err)
+	}
+	currentFilePos, _ = file.Seek(0, io.SeekCurrent) // Update for final check
 
-		// If we are here, it means currentFilePos == state.ResourceOffset.
-		// Since there are no resources and this is the last *data* section before TotalSize is checked:
-		// - ResourceOffset should effectively point to the end of the file if no other conceptual (empty) sections follow.
-		// - TotalSize should be equal to ResourceOffset.
-		if state.ResourceOffset != state.TotalSize {
-			// This warning indicates that TotalSize was calculated to be different from ResourceOffset,
-			// even though the resource section is empty. This might be okay if there are other
-			// *conceptual* empty sections after resources that TotalSize accounts for,
-			// but in your current spec, Resources is the last data table.
-			// The most important check for this 'else' branch is the one above:
-			// that currentFilePos (end of strings) == state.ResourceOffset.
-			log.Printf("Debug: No resources. ResourceOffset (%d) and TotalSize (%d) differ. currentFilePos is %d.", state.ResourceOffset, state.TotalSize, currentFilePos)
-		}
-		// No actual data is written for the resource section if FlagHasResources is not set.
-		// currentFilePos remains unchanged here.
-	}
 	// --- Final Flush and Size Verification ---
-	err = writer.Flush()
-	if err != nil {
-		return fmt.Errorf("final flush: %w", err)
-	}
-	finalFileSize, err := file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return fmt.Errorf("get final file size: %w", err)
-	}
+	finalFileSize := currentFilePos
 	if uint32(finalFileSize) != state.TotalSize {
 		return fmt.Errorf("final write size mismatch: actual %d != calculated total %d", finalFileSize, state.TotalSize)
 	}
@@ -746,87 +658,120 @@ func (state *CompilerState) writeKrbFile(filePath string) error {
 
 // --- Helper functions for writing parts of an element block ---
 
+// writeElementHeader writes the 17-byte KRB element header.
 func writeElementHeader(w *bufio.Writer, el *Element) error {
-	el.PropertyCount = uint8(len(el.KrbProperties))
-	el.CustomPropCount = uint8(len(el.KrbCustomProperties))
-	el.EventCount = uint8(len(el.KrbEvents))
-	// el.ChildCount is set by resolver for main tree, or specifically for templates during template write
-	el.AnimationCount = 0
-
+	// Counts should be finalized on `el` before calling this
 	var err error
-	err = writeUint8(w, el.Type); if err != nil { return err }
-	err = writeUint8(w, el.IDStringIndex); if err != nil { return err }
-	err = writeUint16(w, el.PosX); if err != nil { return err }
-	err = writeUint16(w, el.PosY); if err != nil { return err }
-	err = writeUint16(w, el.Width); if err != nil { return err }
-	err = writeUint16(w, el.Height); if err != nil { return err }
-	err = writeUint8(w, el.Layout); if err != nil { return err }
-	err = writeUint8(w, el.StyleID); if err != nil { return err }
-	err = writeUint8(w, el.PropertyCount); if err != nil { return err }
-	err = writeUint8(w, el.ChildCount); if err != nil { return err }
-	err = writeUint8(w, el.EventCount); if err != nil { return err }
-	err = writeUint8(w, el.AnimationCount); if err != nil { return err }
-	err = writeUint8(w, el.CustomPropCount); if err != nil { return err }
+	if err = writeUint8(w, el.Type); err != nil {
+		return err
+	}
+	if err = writeUint8(w, el.IDStringIndex); err != nil {
+		return err
+	}
+	if err = writeUint16(w, el.PosX); err != nil {
+		return err
+	}
+	if err = writeUint16(w, el.PosY); err != nil {
+		return err
+	}
+	if err = writeUint16(w, el.Width); err != nil {
+		return err
+	}
+	if err = writeUint16(w, el.Height); err != nil {
+		return err
+	}
+	if err = writeUint8(w, el.Layout); err != nil {
+		return err
+	}
+	if err = writeUint8(w, el.StyleID); err != nil {
+		return err
+	}
+	if err = writeUint8(w, el.PropertyCount); err != nil {
+		return err
+	} // Standard KRB Property Count
+	if err = writeUint8(w, el.ChildCount); err != nil {
+		return err
+	} // KRB Child Count
+	if err = writeUint8(w, el.EventCount); err != nil {
+		return err
+	}
+	if err = writeUint8(w, el.AnimationCount); err != nil {
+		return err
+	}
+	if err = writeUint8(w, el.CustomPropCount); err != nil {
+		return err
+	} // KRB Custom Property Count
 	return nil
 }
 
+// writeElementProperties writes standard KRB properties.
 func writeElementProperties(w *bufio.Writer, props []KrbProperty, logPrefix string) error {
 	for i, prop := range props {
 		var err error
-		err = writeUint8(w, prop.PropertyID)
-		if err != nil { return fmt.Errorf("%s #%d PropID: %w", logPrefix, i, err)}
-		err = writeUint8(w, prop.ValueType)
-		if err != nil { return fmt.Errorf("%s #%d ValType: %w", logPrefix, i, err)}
-		err = writeUint8(w, prop.Size)
-		if err != nil { return fmt.Errorf("%s #%d Size: %w", logPrefix, i, err)}
+		if err = writeUint8(w, prop.PropertyID); err != nil {
+			return fmt.Errorf("%s #%d PropID 0x%X: %w", logPrefix, i, prop.PropertyID, err)
+		}
+		if err = writeUint8(w, prop.ValueType); err != nil {
+			return fmt.Errorf("%s #%d ValType 0x%X: %w", logPrefix, i, prop.ValueType, err)
+		}
+		if err = writeUint8(w, prop.Size); err != nil {
+			return fmt.Errorf("%s #%d Size %d: %w", logPrefix, i, prop.Size, err)
+		}
 		if prop.Size > 0 {
 			if prop.Value == nil {
-				return fmt.Errorf("%s #%d nil value for size %d", logPrefix, i, prop.Size)
+				return fmt.Errorf("%s #%d PropID 0x%X: nil value for data size %d", logPrefix, i, prop.PropertyID, prop.Size)
 			}
 			n, writeErr := w.Write(prop.Value)
 			if writeErr != nil {
-				return fmt.Errorf("%s #%d write value: %w", logPrefix, i, writeErr)
+				return fmt.Errorf("%s #%d PropID 0x%X write value: %w", logPrefix, i, prop.PropertyID, writeErr)
 			}
 			if n != int(prop.Size) {
-				return fmt.Errorf("%s #%d short write: %d/%d", logPrefix, i, n, prop.Size)
+				return fmt.Errorf("%s #%d PropID 0x%X short write: %d/%d", logPrefix, i, prop.PropertyID, n, prop.Size)
 			}
 		}
 	}
 	return nil
 }
 
+// writeElementCustomProperties writes custom KRB properties.
 func writeElementCustomProperties(w *bufio.Writer, props []KrbCustomProperty, logPrefix string) error {
 	for i, prop := range props {
 		var err error
-		err = writeUint8(w, prop.KeyIndex)
-		if err != nil { return fmt.Errorf("%s #%d KeyIdx: %w", logPrefix, i, err)}
-		err = writeUint8(w, prop.ValueType)
-		if err != nil { return fmt.Errorf("%s #%d ValType: %w", logPrefix, i, err)}
-		err = writeUint8(w, prop.Size)
-		if err != nil { return fmt.Errorf("%s #%d Size: %w", logPrefix, i, err)}
+		if err = writeUint8(w, prop.KeyIndex); err != nil {
+			return fmt.Errorf("%s #%d KeyIdx %d: %w", logPrefix, i, prop.KeyIndex, err)
+		}
+		if err = writeUint8(w, prop.ValueType); err != nil {
+			return fmt.Errorf("%s #%d ValType 0x%X: %w", logPrefix, i, prop.ValueType, err)
+		}
+		if err = writeUint8(w, prop.Size); err != nil {
+			return fmt.Errorf("%s #%d Size %d: %w", logPrefix, i, prop.Size, err)
+		}
 		if prop.Size > 0 {
 			if prop.Value == nil {
-				return fmt.Errorf("%s #%d nil value for size %d", logPrefix, i, prop.Size)
+				return fmt.Errorf("%s #%d KeyIdx %d: nil value for data size %d", logPrefix, i, prop.KeyIndex, prop.Size)
 			}
 			n, writeErr := w.Write(prop.Value)
 			if writeErr != nil {
-				return fmt.Errorf("%s #%d write value: %w", logPrefix, i, writeErr)
+				return fmt.Errorf("%s #%d KeyIdx %d write value: %w", logPrefix, i, prop.KeyIndex, writeErr)
 			}
 			if n != int(prop.Size) {
-				return fmt.Errorf("%s #%d short write: %d/%d", logPrefix, i, n, prop.Size)
+				return fmt.Errorf("%s #%d KeyIdx %d short write: %d/%d", logPrefix, i, prop.KeyIndex, n, prop.Size)
 			}
 		}
 	}
 	return nil
 }
 
+// writeElementEvents writes KRB events.
 func writeElementEvents(w *bufio.Writer, events []KrbEvent) error {
 	for i, event := range events {
 		var err error
-		err = writeUint8(w, event.EventType)
-		if err != nil { return fmt.Errorf("Event #%d type: %w", i, err) }
-		err = writeUint8(w, event.CallbackID)
-		if err != nil { return fmt.Errorf("Event #%d cbID: %w", i, err) }
+		if err = writeUint8(w, event.EventType); err != nil {
+			return fmt.Errorf("Event #%d type 0x%X: %w", i, event.EventType, err)
+		}
+		if err = writeUint8(w, event.CallbackID); err != nil {
+			return fmt.Errorf("Event #%d cbID %d: %w", i, event.CallbackID, err)
+		}
 	}
 	return nil
 }
@@ -848,58 +793,57 @@ func getBinaryDefaultValue(state *CompilerState, valueStr string, hint uint8) (d
 // that are confirmed to be part of the same template definition.
 // The returned slice is sorted by SelfIndex to ensure a consistent processing/writing order.
 func getTemplateElementIndices(state *CompilerState, rootTemplateElIdx int) []int {
-    var indices []int
-    visited := make(map[int]bool)
-    var collect func(elIdx int)
+	var indices []int
+	visited := make(map[int]bool)
+	var collect func(elIdx int)
 
-    collect = func(elIdx int) {
-        if elIdx < 0 || elIdx >= len(state.Elements) || visited[elIdx] {
-            return
-        }
-        
-        el := &state.Elements[elIdx]
+	collect = func(elIdx int) {
+		if elIdx < 0 || elIdx >= len(state.Elements) || visited[elIdx] {
+			return
+		}
 
-        // To be part of *this* template, an element must either be the designated root
-        // or a descendant that is also marked as IsDefinitionRoot and whose chain of
-        // IsDefinitionRoot parents leads back to this rootTemplateElIdx.
-        // A simpler heuristic for flat template structures: it's the root or its parent was visited.
-        isCorrectTemplatePart := false
-        if elIdx == rootTemplateElIdx {
-            isCorrectTemplatePart = true
-        } else if el.IsDefinitionRoot && el.ParentIndex != -1 && visited[el.ParentIndex] {
-            // If it's a definition part and its parent was part of this collection run, include it.
-            isCorrectTemplatePart = true
-        }
+		el := &state.Elements[elIdx]
 
+		// To be part of *this* template, an element must either be the designated root
+		// or a descendant that is also marked as IsDefinitionRoot and whose chain of
+		// IsDefinitionRoot parents leads back to this rootTemplateElIdx.
+		// A simpler heuristic for flat template structures: it's the root or its parent was visited.
+		isCorrectTemplatePart := false
+		if elIdx == rootTemplateElIdx {
+			isCorrectTemplatePart = true
+		} else if el.IsDefinitionRoot && el.ParentIndex != -1 && visited[el.ParentIndex] {
+			// If it's a definition part and its parent was part of this collection run, include it.
+			isCorrectTemplatePart = true
+		}
 
-        if !isCorrectTemplatePart {
-            return // Not considered part of this specific template's flattened structure
-        }
+		if !isCorrectTemplatePart {
+			return // Not considered part of this specific template's flattened structure
+		}
 
-        indices = append(indices, elIdx)
-        visited[elIdx] = true
+		indices = append(indices, elIdx)
+		visited[elIdx] = true
 
-        for _, childIdx := range el.SourceChildrenIndices {
-            if childIdx >= 0 && childIdx < len(state.Elements) {
-                // Only recurse for children that are themselves part of *some* definition structure.
-                // This is a safeguard to prevent jumping into the main tree.
-                if state.Elements[childIdx].IsDefinitionRoot {
-                     collect(childIdx)
-                }
-            }
-        }
-    }
+		for _, childIdx := range el.SourceChildrenIndices {
+			if childIdx >= 0 && childIdx < len(state.Elements) {
+				// Only recurse for children that are themselves part of *some* definition structure.
+				// This is a safeguard to prevent jumping into the main tree.
+				if state.Elements[childIdx].IsDefinitionRoot {
+					collect(childIdx)
+				}
+			}
+		}
+	}
 
-    if rootTemplateElIdx >= 0 && rootTemplateElIdx < len(state.Elements) {
-         // Ensure the starting point is actually a definition root.
-         if state.Elements[rootTemplateElIdx].IsDefinitionRoot {
-            collect(rootTemplateElIdx)
-         } else {
-            log.Printf("Error: Root index %d provided to getTemplateElementIndices is not itself a definition root.", rootTemplateElIdx)
-         }
-    }
-    sort.Ints(indices) // Sort by original parse order (SelfIndex) for consistent writing
-    return indices
+	if rootTemplateElIdx >= 0 && rootTemplateElIdx < len(state.Elements) {
+		// Ensure the starting point is actually a definition root.
+		if state.Elements[rootTemplateElIdx].IsDefinitionRoot {
+			collect(rootTemplateElIdx)
+		} else {
+			log.Printf("Error: Root index %d provided to getTemplateElementIndices is not itself a definition root.", rootTemplateElIdx)
+		}
+	}
+	sort.Ints(indices) // Sort by original parse order (SelfIndex) for consistent writing
+	return indices
 }
 
 // lineNumForError is a small helper to provide a line number context for errors

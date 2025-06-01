@@ -1,3 +1,4 @@
+// main.go
 package main
 
 import (
@@ -22,31 +23,37 @@ func main() {
 
 	// --- State Initialization ---
 	state := CompilerState{
-		// Initialize slices with some capacity
 		Elements:      make([]Element, 0, 64),
 		Strings:       make([]StringEntry, 0, 128),
 		Styles:        make([]StyleEntry, 0, 32),
 		Resources:     make([]ResourceEntry, 0, 16),
 		ComponentDefs: make([]ComponentDefinition, 0, 16),
-		// HasApp and HeaderFlags will be set during parsing/resolution
+		Variables:     make(map[string]VariableDef), // Initialize Variables map
 	}
 
 	log.Printf("Compiling '%s' to '%s' (KRB v%d.%d)...\n", inputFile, outputFile, KRBVersionMajor, KRBVersionMinor)
 
-	// --- Pass 0: Process Includes ---
-	log.Println("Pass 0: Processing includes...")
-	sourceBuffer, totalLines, err := preprocessIncludes(inputFile)
+	// --- Pass 0.1: Process Includes ---
+	log.Println("Pass 0.1: Processing includes...")
+	sourceAfterIncludes, totalLines, err := preprocessIncludes(inputFile)
 	if err != nil {
-		log.Fatalf("Failed: Preprocessing - %v\n", err)
+		log.Fatalf("Failed: Preprocessing Includes - %v\n", err)
 	}
-	log.Printf("   Preprocessed source: approx %d lines.\n", totalLines)
-	// For debugging preprocessed output:
-	// fmt.Printf("--- Preprocessed Source ---\n%s\n--------------------------\n", sourceBuffer)
+	log.Printf("   Preprocessed includes: approx %d lines.\n", totalLines)
+
+	// --- Pass 0.2: Process Variables ---
+	log.Println("Pass 0.2: Processing variables...")
+	sourceAfterVariables, err := state.ProcessAndSubstituteVariables(sourceAfterIncludes)
+	if err != nil {
+		log.Fatalf("Failed: Processing Variables - %v\n", err)
+	}
+	// For debugging source after variable substitution:
+	// fmt.Printf("--- Source After Variables ---\n%s\n--------------------------\n", sourceAfterVariables)
 
 	// --- Pass 1: Parse Source ---
 	log.Println("Pass 1: Parsing source...")
 	state.CurrentFilePath = inputFile // Set context for parser errors
-	if err := state.parseKrySource(sourceBuffer); err != nil {
+	if err := state.parseKrySource(sourceAfterVariables); err != nil {
 		log.Fatalf("Failed: Parsing - %v\n", err)
 	}
 	log.Printf("   Parsed %d items, %d styles, %d strings, %d res, %d defs.\n",
@@ -57,7 +64,6 @@ func main() {
 	if err := state.resolveStyleInheritance(); err != nil {
 		log.Fatalf("Failed: Style Resolution - %v\n", err)
 	}
-	// Note: Style properties are now finalized AFTER this pass.
 
 	// --- Pass 1.5: Resolve Components and Element Properties ---
 	log.Println("Pass 1.5: Expanding components and resolving element properties...")
@@ -70,19 +76,16 @@ func main() {
 	if err := state.calculateOffsetsAndSizes(); err != nil {
 		log.Fatalf("Failed: Offset Calculation - %v\n", err)
 	}
-	// Note: Header offsets and total size are determined AFTER this pass.
 
 	// --- Pass 3: Write Binary KRB File ---
 	log.Println("Pass 3: Writing KRB binary...")
 	if err := state.writeKrbFile(outputFile); err != nil {
 		log.Printf("Failed: Writing Binary - %v\n", err)
-		// Attempt to remove partially written file on error
 		_ = os.Remove(outputFile)
 		os.Exit(1)
 	}
 
 	// --- Success Message ---
-	// Get final size for confirmation message
 	info, statErr := os.Stat(outputFile)
 	finalSize := int64(-1)
 	if statErr == nil {

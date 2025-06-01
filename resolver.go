@@ -62,25 +62,26 @@ func (state *CompilerState) resolveComponentsAndProperties() error {
 	}
 
 	processedCount := 0
-	unprocessedIndices := []int{}
+	// unprocessedIndices := []int{} // Only needed for debugging
 	for k := range state.Elements {
 		if state.Elements[k].ProcessedInPass15 {
 			processedCount++
-		} else {
-			unprocessedIndices = append(unprocessedIndices, k)
 		}
+		// else {
+		// unprocessedIndices = append(unprocessedIndices, k)
+		// }
 	}
 
-	if len(unprocessedIndices) > 0 {
-		log.Printf("Warning: %d/%d elements processed in Pass 1.5. Unprocessed indices: %v. This might indicate orphaned elements or an error in the recursion guard.", processedCount, len(state.Elements), unprocessedIndices)
-	}
+	// if len(unprocessedIndices) > 0 { // Only needed for debugging
+	// 	log.Printf("Warning: %d/%d elements processed in Pass 1.5. Unprocessed indices: %v...", processedCount, len(state.Elements), unprocessedIndices)
+	// }
 
 	log.Printf("   Property and Component Resolution Pass Complete. Total elements processed: %d\n", processedCount)
 	return nil
 }
 
-// resolveElementRecursive is the core function for resolving a single element's properties.
-// It handles standard elements, component instances, and template definition elements.
+// resolveElementRecursive processes a single element, resolving its properties
+// according to its type (standard element, component instance, or template element part).
 func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 	if elementIndex < 0 || elementIndex >= len(state.Elements) {
 		return fmt.Errorf("internal: invalid element index %d for resolution", elementIndex)
@@ -88,15 +89,20 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 
 	el := &state.Elements[elementIndex]
 	if el.ProcessedInPass15 {
-		return nil // Already processed in this pass
+		return nil // Already processed
 	}
-	el.ProcessedInPass15 = true // Mark as visited for this pass
+	el.ProcessedInPass15 = true
 
-	// Store original source properties from the parser, as el.SourceProperties will be modified for instances
-	originalSourcePropertiesFromParser := make([]SourceProperty, len(el.SourceProperties))
-	copy(originalSourcePropertiesFromParser, el.SourceProperties)
+	// Reset resolved KRB data structures for this element
+	el.KrbProperties = el.KrbProperties[:0]
+	el.KrbCustomProperties = el.KrbCustomProperties[:0]
+	el.KrbEvents = el.KrbEvents[:0]
+	el.PropertyCount, el.CustomPropCount, el.EventCount = 0, 0, 0
+	el.StyleID = 0 // Will be determined from source properties or component defaults
 
-	// --- Step 1: Component Instance Property Merging ---
+	processedSourcePropKeys := make(map[string]bool)
+
+	// --- Step 1: Handle Component Instance Specifics (Placeholder Setup) ---
 	if el.IsComponentInstance {
 		if el.ComponentDef == nil {
 			return fmt.Errorf("L%d: internal: component instance '%s' (idx %d) has nil ComponentDef", el.SourceLineNum, el.SourceElementName, el.SelfIndex)
@@ -104,122 +110,110 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 		componentDef := el.ComponentDef
 
 		if componentDef.DefinitionRootElementIndex < 0 || componentDef.DefinitionRootElementIndex >= len(state.Elements) {
-			return fmt.Errorf("L%d: internal: component def '%s' has invalid root element index %d", el.SourceLineNum, componentDef.Name, componentDef.DefinitionRootElementIndex)
+			return fmt.Errorf("L%d: internal: component def '%s' has invalid root element index %d for template", el.SourceLineNum, componentDef.Name, componentDef.DefinitionRootElementIndex)
 		}
-		defRootElementTemplate := &state.Elements[componentDef.DefinitionRootElementIndex]
-		el.Type = defRootElementTemplate.Type // Instance takes the type of the template's root
+		// The placeholder element's Type should match the Type of the component definition's root element.
+		defRootTemplateElement := &state.Elements[componentDef.DefinitionRootElementIndex]
+		el.Type = defRootTemplateElement.Type // This makes the placeholder have the same base type.
 
-		// Merge Properties: Order of precedence (lowest to highest):
-		// 1. Properties from the definition's root element template.
-		// 2. Default values from the `Properties {}` block of the Define.
-		// 3. Properties from the KRY usage tag of the instance.
-		mergedPropsMap := make(map[string]SourceProperty)
-
-		// 1. Base: Template root's own properties
-		for _, prop := range defRootElementTemplate.SourceProperties {
-			mergedPropsMap[prop.Key] = prop
+		// Add the mandatory _componentName custom property
+		compNameKeyIdx, keyErr := state.addString(componentNameConventionKey)
+		if keyErr != nil {
+			return fmt.Errorf("L%d: error adding string for _componentName key '%s': %w", el.SourceLineNum, componentNameConventionKey, keyErr)
 		}
-
-		// 2. Overlay: Define.Properties defaults
-		for _, propDef := range componentDef.Properties {
-			if propDef.DefaultValueStr != "" {
-				// Apply default if key not present from template root,
-				// OR if it is a component-declared prop (its default should be considered).
-				_, exists := mergedPropsMap[propDef.Name]
-				if !exists || isDeclaredProp(propDef.Name, componentDef.Properties) {
-					cleanedVal, _ := cleanAndQuoteValue(propDef.DefaultValueStr)
-					mergedPropsMap[propDef.Name] = SourceProperty{
-						Key: propDef.Name, ValueStr: cleanedVal, LineNum: componentDef.DefinitionStartLine,
-					}
-				}
-			}
+		compNameValIdx, valErr := state.addString(componentDef.Name)
+		if valErr != nil {
+			return fmt.Errorf("L%d: error adding string for _componentName value '%s': %w", el.SourceLineNum, componentDef.Name, valErr)
 		}
 
-		// 3. Override: Instance usage tag properties
-		for _, prop := range originalSourcePropertiesFromParser {
-			mergedPropsMap[prop.Key] = prop
+		if len(el.KrbCustomProperties) < MaxCustomProperties {
+			el.KrbCustomProperties = append(el.KrbCustomProperties, KrbCustomProperty{
+				KeyIndex:  compNameKeyIdx,
+				ValueType: ValTypeString, // String index for the component name
+				Size:      1,             // Size of the string index (1 byte)
+				Value:     []byte{compNameValIdx},
+			})
+		} else {
+			return fmt.Errorf("L%d: max custom KRB properties (%d) reached for '%s', cannot add _componentName", el.SourceLineNum, MaxCustomProperties, el.SourceElementName)
 		}
-
-		el.SourceProperties = make([]SourceProperty, 0, len(mergedPropsMap))
-		for _, prop := range mergedPropsMap {
-			el.SourceProperties = append(el.SourceProperties, prop)
-		}
-
-		// Set hints from merged properties for later use (e.g., by writer or specific component logic)
-		if v, ok := mergedPropsMap["orientation"]; ok {
-			cs, _ := cleanAndQuoteValue(v.ValueStr)
-			el.OrientationHint = cs
-		}
-		if v, ok := mergedPropsMap["position"]; ok {
-			cs, _ := cleanAndQuoteValue(v.ValueStr)
-			el.PositionHint = cs
-		}
+		// IMPORTANT: We DO NOT merge SourceProperties from the template into the instance here.
+		// The instance's `el.SourceProperties` are *only* from its KRY usage tag.
+		// Template defaults are handled by the runtime during instantiation, using the KRB Component Definition.
 	}
 
-	// --- Step 2: Reset Resolved Data & Process Header Fields ---
-	el.KrbProperties = el.KrbProperties[:0]
-	el.KrbCustomProperties = el.KrbCustomProperties[:0]
-	el.KrbEvents = el.KrbEvents[:0]
-	el.PropertyCount, el.CustomPropCount, el.EventCount = 0, 0, 0
-	el.StyleID = 0 // Reset, will be determined from source properties
-	processedSourcePropKeys := make(map[string]bool)
+	// --- Step 2: Process KRY Source Properties for Header Fields & Style ---
+	// This applies to all element types (standard, instance placeholders, template elements)
 
-	// Determine Final StyleID for this element
+	// Determine StyleID for this element
+	// For component instances, `style` or `bar_style` (if applicable) from the KRY usage tag
+	// sets the StyleID on the placeholder. The runtime will then apply this to the
+	// instantiated component's root.
+	// For template elements, this sets the default style of that template part.
 	if directStyleStr, hasDirectStyle := el.getSourcePropertyValue("style"); hasDirectStyle {
-		cleanedString, _ := cleanAndQuoteValue(directStyleStr)
-		if cleanedString != "" {
-			styleID := state.findStyleIDByName(cleanedString)
-			if styleID == 0 && cleanedString != "" { // Don't warn for empty style string like style: ""
-				log.Printf("L%d: Warn: Style '%s' not found for element '%s'.\n", el.SourceLineNum, cleanedString, el.SourceElementName)
-			}
-			el.StyleID = styleID
+		err := state.applyStyleStringToElement(el, directStyleStr, el.SourceLineNum)
+		if err != nil {
+			return fmt.Errorf("L%d: error applying style string '%s' to element '%s': %w", el.SourceLineNum, directStyleStr, el.SourceElementName, err)
 		}
 		processedSourcePropKeys["style"] = true
 	}
 
-	// Component-specific style handling (e.g., bar_style for TabBar)
+	// Component-specific style property handling (e.g., bar_style for TabBar instances)
 	if el.IsComponentInstance && el.ComponentDef != nil {
 		componentDef := el.ComponentDef
-		if barStyleIsDeclared(componentDef) { // Check if 'bar_style' is a declared prop for this component type
+		// Example for 'bar_style', adapt for other conventional style properties
+		if barStyleIsDeclared(componentDef) { // Checks if 'bar_style' is in Define.Properties
 			if barStyleStr, hasBarStyle := el.getSourcePropertyValue("bar_style"); hasBarStyle {
-				cleanedString, _ := cleanAndQuoteValue(barStyleStr)
-				if cleanedString != "" { // User provided a value for bar_style
-					styleID := state.findStyleIDByName(cleanedString)
-					if styleID == 0 && cleanedString != "" {
-						log.Printf("L%d: Warn: Component prop bar_style value '%s' (style name) not found for instance of '%s'.\n", el.SourceLineNum, cleanedString, componentDef.Name)
+				cleanedBarStyleName, _ := cleanAndQuoteValue(barStyleStr)
+				if cleanedBarStyleName != "" { // User provided a value for bar_style
+					styleID := state.findStyleIDByName(cleanedBarStyleName)
+					if styleID == 0 && cleanedBarStyleName != "" { // Only warn if a non-empty name was not found
+						log.Printf("L%d: Warn: Style '%s' (for 'bar_style' property) on instance '%s' of component '%s' not found.\n", el.SourceLineNum, cleanedBarStyleName, el.SourceElementName, componentDef.Name)
 					}
-					el.StyleID = styleID // This overrides any `style:` property
-				} else if el.StyleID == 0 { // bar_style: "" was provided, and no `style:` was set, check for bar_style default
+					el.StyleID = styleID // This overrides any `style:` on the instance placeholder
+				} else if el.StyleID == 0 { // bar_style: "" was provided, and no `style:` was set, check for bar_style default from Define.Properties
 					defaultStyleName := getDefaultBarStyleName(componentDef, "") // Get default from Define.Properties
 					if defaultStyleName != "" {
 						styleID := state.findStyleIDByName(defaultStyleName)
 						if styleID == 0 && defaultStyleName != "" {
-							log.Printf("L%d: Warn: Component prop bar_style default '%s' (style name) not found for instance of '%s'.\n", el.SourceLineNum, defaultStyleName, componentDef.Name)
+							log.Printf("L%d: Warn: Default style '%s' (from Define.Properties for 'bar_style') on instance '%s' of component '%s' not found.\n", el.SourceLineNum, defaultStyleName, el.SourceElementName, componentDef.Name)
 						}
 						el.StyleID = styleID
 					}
 				}
 				processedSourcePropKeys["bar_style"] = true
+			} else if el.StyleID == 0 { // No 'bar_style' in KRY usage, and no 'style:' in KRY usage. Check Define.Properties for 'bar_style' default.
+				defaultStyleName := getDefaultBarStyleName(componentDef, "")
+				if defaultStyleName != "" {
+					styleID := state.findStyleIDByName(defaultStyleName)
+					if styleID == 0 && defaultStyleName != "" {
+						log.Printf("L%d: Warn: Default style '%s' (from Define.Properties for bar_style) on instance '%s' of component '%s' not found.\n", el.SourceLineNum, defaultStyleName, el.SourceElementName, componentDef.Name)
+					}
+					el.StyleID = styleID
+				}
 			}
 		}
-		// Apply component-type-specific default style if NO style has been set by `style:` or handled by `bar_style:`
+		// Apply component-type-specific fallback default style if NO style has been set yet by any means
 		if el.StyleID == 0 {
-			if componentDef.Name == "TabBar" { // Example hardcoded default for TabBar
+			if componentDef.Name == "TabBar" { // Example hardcoded fallback default for TabBar
+				// Determine orientation for TabBar (could be from a custom prop or a hint)
+				// For simplicity, assuming el.OrientationHint is set if applicable.
 				baseStyleName := "tab_bar_style_base_row" // Default for row orientation
 				if el.OrientationHint == "column" || el.OrientationHint == "col" {
 					baseStyleName = "tab_bar_style_base_column"
 				}
-				defaultStyleID := state.findStyleIDByName(baseStyleName)
-				if defaultStyleID == 0 && baseStyleName != "" { // Don't warn if baseStyleName itself is empty
-					log.Printf("L%d: Warn: TabBar default style '%s' not found for instance '%s'.\n", el.SourceLineNum, baseStyleName, el.SourceElementName)
+				styleID := state.findStyleIDByName(baseStyleName)
+				if styleID == 0 && baseStyleName != "" {
+					log.Printf("L%d: Warn: TabBar fallback default style '%s' not found for instance '%s'.\n", el.SourceLineNum, baseStyleName, el.SourceElementName)
 				}
-				el.StyleID = defaultStyleID
+				el.StyleID = styleID
 			}
-			// Add other component type specific default style logic here
+			// Add other component type specific default style logic here if needed
 		}
 	}
 
 	// Process KRY source properties that map to KRB Element Header fields
+	// `el.SourceProperties` here are from the KRY usage tag for instances,
+	// or from the KRY definition for template elements.
 	for _, sp := range el.SourceProperties {
 		key, valStr, lineNum := sp.Key, sp.ValueStr, sp.LineNum
 		if processedSourcePropKeys[key] { // Skip if already handled (e.g., style, bar_style)
@@ -239,7 +233,7 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 					el.IDStringIndex = idx
 					el.SourceIDName = cleanedString // Store the actual ID string for debugging/logging
 				} else {
-					parseErr = err // Error adding string
+					parseErr = fmt.Errorf("adding id string '%s': %w", cleanedString, err)
 				}
 			}
 		case "pos_x":
@@ -265,10 +259,11 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 				el.Width = uint16(v)
 			} else { // Could not parse as uint; check if it's a percentage string
 				if !strings.HasSuffix(cleanedString, "%") { // Not a percentage, so it's a parse error for the header field
-					parseErr = fmt.Errorf("header width '%s': %w", cleanedString, err)
-				} else { // It is a percentage string, so it's not for the header field `el.Width`.
-					// It will be handled by `max_width` or `width` mapping to `PropIDMaxWidth` with `ValTypePercentage` later.
-					handledAsHeaderField = false
+					parseErr = fmt.Errorf("header width '%s' (expected pixel value): %w", cleanedString, err)
+				} else {
+					// It IS a percentage string. This means it's NOT for the direct header field `el.Width`.
+					// It will be handled by `PropIDMaxWidth` with `ValTypePercentage` later in Step 3.
+					handledAsHeaderField = false // Unmark, so it gets processed in Step 3
 				}
 			}
 		case "height": // KRY 'height' for direct element header field
@@ -278,33 +273,34 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 				el.Height = uint16(v)
 			} else { // Could not parse as uint; check if it's a percentage string
 				if !strings.HasSuffix(cleanedString, "%") { // Not a percentage, so it's a parse error for the header field
-					parseErr = fmt.Errorf("header height '%s': %w", cleanedString, err)
-				} else { // It is a percentage string, so it's not for the header field `el.Height`.
-					handledAsHeaderField = false
+					parseErr = fmt.Errorf("header height '%s' (expected pixel value): %w", cleanedString, err)
+				} else {
+					// It IS a percentage string. Not for direct `el.Height`.
+					// Will be handled by `PropIDMaxHeight` later.
+					handledAsHeaderField = false // Unmark
 				}
 			}
-		case "layout": // KRY `layout` property sets the source for el.Layout byte calculation
+		case "layout": // KRY `layout` property string is parsed into el.LayoutFlagsSource
 			handledAsHeaderField = true
-			// el.LayoutFlagsSource is already set by the parser from this string.
-			// No further action needed here for this key regarding header fields.
+			el.LayoutFlagsSource = parseLayoutString(cleanedString) // parseLayoutString is from utils.go
 		}
+
 		if parseErr != nil {
-			return fmt.Errorf("L%d: parsing header field '%s: %s': %w", lineNum, key, valStr, parseErr)
+			return fmt.Errorf("L%d: error parsing header field '%s: %s' for element '%s': %w", lineNum, key, valStr, el.SourceElementName, parseErr)
 		}
 		if handledAsHeaderField {
 			processedSourcePropKeys[key] = true
 		}
 	}
 
-	// --- Step 3: Resolve Remaining SourceProperties to KRB Properties, Events, or Custom Props ---
+	// --- Step 3: Resolve Remaining SourceProperties to KRB Standard Properties, KRB Events, or KRB Custom Properties ---
 	var parsedPaddingTop, parsedPaddingRight, parsedPaddingBottom, parsedPaddingLeft *uint8
-	var parsedPaddingShort string // To store the raw shorthand string for padding
+	var parsedPaddingShort string
 	var foundPaddingShort, foundPaddingLong bool = false, false
-	// (Similar temp vars for margin could be added if complex margin shorthand is supported)
 
 	for _, sp := range el.SourceProperties {
 		key, valStr, lineNum := sp.Key, sp.ValueStr, sp.LineNum
-		if processedSourcePropKeys[key] { // Skip if handled as header field or style key
+		if processedSourcePropKeys[key] { // Skip if already handled as a header field or specific style key
 			continue
 		}
 
@@ -313,30 +309,45 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 		var handleErr error
 
 		// A. Events
-		if key == "onClick" || key == "on_click" { // Add other KRY event names here
+		if isEventKey(key) { // isEventKey checks "onClick", "onSubmit", etc.
 			propProcessedThisIteration = true
-			if len(el.KrbEvents) < MaxEvents {
-				if cleanedString != "" { // Callback name should not be empty
-					cbIdx, addErr := state.addString(cleanedString)
-					if addErr == nil {
-						el.KrbEvents = append(el.KrbEvents, KrbEvent{EventTypeClick, cbIdx})
+			// For component instances, events are attached to the placeholder. Runtime may re-target.
+			// For template elements, events are generally NOT part of the static template definition.
+			if el.IsDefinitionRoot && !el.IsComponentInstance { // If it's an element *within* a Define block's template
+				log.Printf("L%d: Warn: Event handler '%s' defined on template element '%s'. Events are typically instance-specific and should be on the component usage or handled by runtime logic. Ignored for template element.", lineNum, key, el.SourceElementName)
+			} else { // Standard element or Component Instance Placeholder
+				if len(el.KrbEvents) < MaxEvents {
+					if cleanedString != "" { // Callback name should not be empty
+						cbIdx, addErr := state.addString(cleanedString)
+						if addErr == nil {
+							// Map KRY event key to KRB EventType
+							var eventType uint8 = EventTypeClick // Default
+							switch key {
+							case "onClick", "on_click":
+								eventType = EventTypeClick
+								// Add other mappings: onSubmit -> EventTypeSubmit, etc.
+								// case "onSubmit", "on_submit": eventType = EventTypeSubmit
+							}
+							el.KrbEvents = append(el.KrbEvents, KrbEvent{EventType: eventType, CallbackID: cbIdx})
+						} else {
+							handleErr = fmt.Errorf("adding event callback string '%s' for event '%s': %w", cleanedString, key, addErr)
+						}
 					} else {
-						handleErr = fmt.Errorf("adding onClick callback string '%s': %w", cleanedString, addErr)
+						log.Printf("L%d: Warn: Empty callback string for event '%s' on element '%s'. Ignored.\n", lineNum, key, el.SourceElementName)
 					}
-				} else {
-					log.Printf("L%d: Warn: Empty callback string for '%s' on element '%s'. Ignored.\n", lineNum, key, el.SourceElementName)
+				} else { // Max events reached
+					handleErr = fmt.Errorf("maximum events (%d) reached for element '%s' when trying to add '%s'", MaxEvents, el.SourceElementName, key)
 				}
-			} else { // Max events reached
-				handleErr = fmt.Errorf("maximum events (%d) reached for element '%s'", MaxEvents, el.SourceElementName)
 			}
 		}
 
-		// B. Standard KRB Properties & Padding/Margin temp storage
+		// B. Standard KRB Properties (for placeholder or standard element or template default)
+		// & Padding/Margin temporary storage
 		if !propProcessedThisIteration {
 			switch key {
 			case "padding":
 				propProcessedThisIteration = true
-				parsedPaddingShort = cleanedString // Store the original shorthand string
+				parsedPaddingShort = cleanedString
 				foundPaddingShort = true
 			case "padding_top":
 				propProcessedThisIteration = true
@@ -378,7 +389,7 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 				} else {
 					handleErr = fmt.Errorf("parsing padding_left value '%s': %w", cleanedString, e)
 				}
-			case "margin": // Simple margin handling for now
+			case "margin":
 				propProcessedThisIteration = true
 				handleErr = handleSimpleMarginProperty(el, PropIDMargin, cleanedString)
 			case "background_color":
@@ -396,7 +407,7 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 			case "border_radius":
 				propProcessedThisIteration = true
 				handleErr = addByteProp(el, PropIDBorderRadius, cleanedString)
-			case "opacity": // KRY float 0.0-1.0 -> KRB 8.8 fixed point (ValTypePercentage)
+			case "opacity":
 				propProcessedThisIteration = true
 				handleErr = addFixedPointProp(el, PropIDOpacity, cleanedString, &state.HeaderFlags)
 			case "visibility", "visible":
@@ -416,7 +427,7 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 				zIndexVal, e := strconv.ParseInt(cleanedString, 10, 16) // int16
 				if e == nil {
 					buf := make([]byte, 2)
-					binary.LittleEndian.PutUint16(buf, uint16(zIndexVal)) // KRB stores as uint16
+					binary.LittleEndian.PutUint16(buf, uint16(zIndexVal))
 					handleErr = el.addKrbProperty(PropIDZindex, ValTypeShort, buf)
 				} else {
 					handleErr = fmt.Errorf("parsing z_index value '%s': %w", cleanedString, e)
@@ -435,29 +446,29 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 				handleErr = addShortProp(el, PropIDFontSize, cleanedString)
 			case "font_weight":
 				propProcessedThisIteration = true
-				weightVal := uint8(0) // Default to Normal
+				weightVal := uint8(0)
 				lc := strings.ToLower(cleanedString)
-				if lc == "bold" || lc == "700" { // Common KRY values for bold
-					weightVal = 1 // KRB enum for Bold
-				} else if lc != "normal" && lc != "400" && lc != "" { // Allow empty to be normal
-					log.Printf("L%d: Warn: Invalid font_weight '%s' for element '%s'. Using 'normal'.", lineNum, cleanedString, el.SourceElementName)
+				if lc == "bold" || lc == "700" {
+					weightVal = 1
+				} else if lc != "normal" && lc != "400" && lc != "" {
+					log.Printf("L%d: Warn: Invalid font_weight '%s' for '%s'. Using 'normal'.", lineNum, cleanedString, el.SourceElementName)
 				}
 				handleErr = el.addKrbProperty(PropIDFontWeight, ValTypeEnum, []byte{weightVal})
 			case "text_alignment":
 				propProcessedThisIteration = true
-				alignVal := uint8(0) // Default to Start
+				alignVal := uint8(0)
 				switch strings.ToLower(cleanedString) {
 				case "center", "centre":
-					alignVal = 1 // KRB enum for Center
+					alignVal = 1
 				case "right", "end":
-					alignVal = 2 // KRB enum for End
-				case "left", "start", "": // Allow empty to be start
+					alignVal = 2
+				case "left", "start", "":
 					alignVal = 0
 				default:
-					log.Printf("L%d: Warn: Invalid text_alignment '%s' for element '%s'. Using 'start'.", lineNum, cleanedString, el.SourceElementName)
+					log.Printf("L%d: Warn: Invalid text_alignment '%s' for '%s'. Using 'start'.", lineNum, cleanedString, el.SourceElementName)
 				}
 				handleErr = el.addKrbProperty(PropIDTextAlignment, ValTypeEnum, []byte{alignVal})
-			case "gap": // Spacing for flow layout children
+			case "gap":
 				propProcessedThisIteration = true
 				handleErr = addShortProp(el, PropIDGap, cleanedString)
 			case "min_width":
@@ -466,10 +477,16 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 			case "min_height":
 				propProcessedThisIteration = true
 				handleErr = addSizeDimensionProp(state, el, PropIDMinHeight, cleanedString)
-			case "max_width": // KRY `width` often maps here for constraints
+			case "width": // This KRY 'width' maps to PropIDMaxWidth if not handled as header field (i.e., if it's a percentage)
 				propProcessedThisIteration = true
 				handleErr = addSizeDimensionProp(state, el, PropIDMaxWidth, cleanedString)
-			case "max_height": // KRY `height` often maps here for constraints
+			case "height": // This KRY 'height' maps to PropIDMaxHeight if not handled as header field
+				propProcessedThisIteration = true
+				handleErr = addSizeDimensionProp(state, el, PropIDMaxHeight, cleanedString)
+			case "max_width": // Explicit KRY 'max_width'
+				propProcessedThisIteration = true
+				handleErr = addSizeDimensionProp(state, el, PropIDMaxWidth, cleanedString)
+			case "max_height": // Explicit KRY 'max_height'
 				propProcessedThisIteration = true
 				handleErr = addSizeDimensionProp(state, el, PropIDMaxHeight, cleanedString)
 			case "aspect_ratio":
@@ -477,65 +494,118 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 				handleErr = addFixedPointProp(el, PropIDAspectRatio, cleanedString, &state.HeaderFlags)
 			case "overflow":
 				propProcessedThisIteration = true
-				overflowVal := uint8(0) // Default to Visible
+				overflowVal := uint8(0)
 				switch strings.ToLower(cleanedString) {
 				case "hidden":
 					overflowVal = 1
 				case "scroll":
 					overflowVal = 2
-				case "visible", "": // Allow empty to be visible
+				case "visible", "":
 					overflowVal = 0
 				default:
-					log.Printf("L%d: Warn: Invalid overflow value '%s' for element '%s'. Using 'visible'.", lineNum, cleanedString, el.SourceElementName)
+					log.Printf("L%d: Warn: Invalid overflow '%s' for '%s'. Using 'visible'.", lineNum, cleanedString, el.SourceElementName)
 				}
 				handleErr = el.addKrbProperty(PropIDOverflow, ValTypeEnum, []byte{overflowVal})
-			case "image_source", "source": // For Image, Button (icon), or custom components
-				if el.Type == ElemTypeImage || el.Type == ElemTypeButton || el.IsComponentInstance {
+			case "image_source", "source":
+				if el.Type == ElemTypeImage || el.Type == ElemTypeButton { // Or if el is a component placeholder whose root can take an image
 					propProcessedThisIteration = true
 					handleErr = state.addKrbResourceProperty(el, PropIDImageSource, ResTypeImage, cleanedString)
 				}
+				// If not handled here, it might be a custom property for a component instance.
 			// App-specific props (only apply if el.Type is ElemTypeApp)
 			case "window_width":
-				if el.Type == ElemTypeApp { propProcessedThisIteration = true; handleErr = addShortProp(el, PropIDWindowWidth, cleanedString) }
+				if el.Type == ElemTypeApp {
+					propProcessedThisIteration = true
+					handleErr = addShortProp(el, PropIDWindowWidth, cleanedString)
+				}
 			case "window_height":
-				if el.Type == ElemTypeApp { propProcessedThisIteration = true; handleErr = addShortProp(el, PropIDWindowHeight, cleanedString) }
+				if el.Type == ElemTypeApp {
+					propProcessedThisIteration = true
+					handleErr = addShortProp(el, PropIDWindowHeight, cleanedString)
+				}
 			case "window_title":
-				if el.Type == ElemTypeApp { propProcessedThisIteration = true; handleErr = state.addKrbStringProperty(el, PropIDWindowTitle, cleanedString) }
+				if el.Type == ElemTypeApp {
+					propProcessedThisIteration = true
+					handleErr = state.addKrbStringProperty(el, PropIDWindowTitle, cleanedString)
+				}
 			case "resizable":
-				if el.Type == ElemTypeApp { propProcessedThisIteration = true; b := uint8(0); if cleanedString == "true" || cleanedString == "1" { b = 1 }; handleErr = el.addKrbProperty(PropIDResizable, ValTypeByte, []byte{b}) }
+				if el.Type == ElemTypeApp {
+					propProcessedThisIteration = true
+					b := uint8(0)
+					if cleanedString == "true" || cleanedString == "1" {
+						b = 1
+					}
+					handleErr = el.addKrbProperty(PropIDResizable, ValTypeByte, []byte{b})
+				}
 			case "icon":
-				if el.Type == ElemTypeApp { propProcessedThisIteration = true; handleErr = state.addKrbResourceProperty(el, PropIDIcon, ResTypeImage, cleanedString) }
-			case "version": // App version
-				if el.Type == ElemTypeApp { propProcessedThisIteration = true; handleErr = state.addKrbStringProperty(el, PropIDVersion, cleanedString) }
+				if el.Type == ElemTypeApp {
+					propProcessedThisIteration = true
+					handleErr = state.addKrbResourceProperty(el, PropIDIcon, ResTypeImage, cleanedString)
+				}
+			case "version":
+				if el.Type == ElemTypeApp {
+					propProcessedThisIteration = true
+					handleErr = state.addKrbStringProperty(el, PropIDVersion, cleanedString)
+				}
 			case "author":
-				if el.Type == ElemTypeApp { propProcessedThisIteration = true; handleErr = state.addKrbStringProperty(el, PropIDAuthor, cleanedString) }
-			case "keep_aspect": // App keep aspect
-				if el.Type == ElemTypeApp { propProcessedThisIteration = true; b := uint8(0); if cleanedString == "true" || cleanedString == "1" { b = 1 }; handleErr = el.addKrbProperty(PropIDKeepAspect, ValTypeByte, []byte{b}) }
-			case "scale_factor": // App scale factor
-				if el.Type == ElemTypeApp { propProcessedThisIteration = true; handleErr = addFixedPointProp(el, PropIDScaleFactor, cleanedString, &state.HeaderFlags) }
+				if el.Type == ElemTypeApp {
+					propProcessedThisIteration = true
+					handleErr = state.addKrbStringProperty(el, PropIDAuthor, cleanedString)
+				}
+			case "keep_aspect":
+				if el.Type == ElemTypeApp {
+					propProcessedThisIteration = true
+					b := uint8(0)
+					if cleanedString == "true" || cleanedString == "1" {
+						b = 1
+					}
+					handleErr = el.addKrbProperty(PropIDKeepAspect, ValTypeByte, []byte{b})
+				}
+			case "scale_factor":
+				if el.Type == ElemTypeApp {
+					propProcessedThisIteration = true
+					handleErr = addFixedPointProp(el, PropIDScaleFactor, cleanedString, &state.HeaderFlags)
+				}
 			}
 		}
 
 		// C. Custom Properties for Component Instances
+		// This is for properties from the KRY usage tag that are declared in `Define.Properties`
+		// and are NOT standard KRY element properties handled above.
 		if !propProcessedThisIteration && el.IsComponentInstance && el.ComponentDef != nil {
 			if declaredPropDef := findDeclaredProperty(key, el.ComponentDef.Properties); declaredPropDef != nil {
-				propProcessedThisIteration = true
-				keyIdx, keyErr := state.addString(key)
-				if keyErr != nil {
-					handleErr = fmt.Errorf("adding custom prop key '%s': %w", key, keyErr)
-				} else {
-					customValueBytes, customValueType, customValueSize, parseValErr :=
-						parseKryValueToKrbBytes(state, cleanedString, declaredPropDef.ValueTypeHint, key, lineNum)
-					if parseValErr == nil {
-						if len(el.KrbCustomProperties) < MaxCustomProperties {
-							el.KrbCustomProperties = append(el.KrbCustomProperties, KrbCustomProperty{
-								KeyIndex: keyIdx, ValueType: customValueType, Size: customValueSize, Value: customValueBytes,
-							})
-						} else {
-							handleErr = fmt.Errorf("max custom KRB properties (%d) for '%s'", MaxCustomProperties, el.SourceElementName)
-						}
+				// Check if 'key' is a standard element property (like 'width', 'height', 'text')
+				// If it IS a standard property, it should have been handled in section B and applied
+				// to the placeholder's KrbProperties. It should NOT become a custom property.
+				// We need a robust way to distinguish. For now, assume if it wasn't processed in B,
+				// and it's declared in Define.Properties, it's a true custom prop for the component's logic.
+				// This relies on section B comprehensively handling all KRY keys that map to *standard* KRB props.
+
+				isStandardKeyAlreadyHandled := false // This check might be redundant if section B is exhaustive.
+				// (Potentially add a check here if 'key' is a known standard KRY property name)
+
+				if !isStandardKeyAlreadyHandled {
+					propProcessedThisIteration = true
+					keyIdx, keyErr := state.addString(key)
+					if keyErr != nil {
+						handleErr = fmt.Errorf("adding custom prop key '%s' to string table: %w", key, keyErr)
 					} else {
-						handleErr = fmt.Errorf("parsing value for custom prop '%s: %s': %w", key, cleanedString, parseValErr)
+						customValueBytes, customValueType, customValueSize, parseValErr :=
+							parseKryValueToKrbBytes(state, cleanedString, declaredPropDef.ValueTypeHint, key, lineNum)
+						if parseValErr == nil {
+							if len(el.KrbCustomProperties) < MaxCustomProperties {
+								el.KrbCustomProperties = append(el.KrbCustomProperties, KrbCustomProperty{
+									KeyIndex:  keyIdx,
+									ValueType: customValueType,
+									Size:      customValueSize,
+									Value:     customValueBytes,
+								})
+							} else {
+								handleErr = fmt.Errorf("max custom KRB properties (%d) reached for instance '%s', cannot add '%s'", MaxCustomProperties, el.SourceElementName, key)
+							}
+						} else {
+							handleErr = fmt.Errorf("parsing value for custom prop '%s: %s' on instance '%s': %w", key, cleanedString, el.SourceElementName, parseValErr)
+						}
 					}
 				}
 			}
@@ -543,13 +613,16 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 
 		// D. Log Unhandled Property
 		if !propProcessedThisIteration {
+			// This warning will trigger if a KRY property isn't an event,
+			// isn't a standard KRB property mapping, and (if it's a component instance)
+			// isn't a declared property in its Define.Properties block.
 			logUnhandledPropWarning(state, el, key, lineNum)
 		}
 
 		if handleErr != nil {
-			if isRecoverablePropError(key, handleErr) { // For less critical parsing errors (e.g., padding format)
-				log.Printf("L%d: Recoverable error processing property '%s' for '%s': %v. Continuing.", lineNum, key, el.SourceElementName, handleErr)
-			} else { // For more critical errors
+			if isRecoverablePropError(key, handleErr) {
+				log.Printf("L%d: Recoverable error processing property '%s: %s' for element '%s': %v. Continuing.", lineNum, key, valStr, el.SourceElementName, handleErr)
+			} else {
 				return fmt.Errorf("L%d: error processing property '%s: %s' for element '%s': %w", lineNum, key, valStr, el.SourceElementName, handleErr)
 			}
 		}
@@ -561,10 +634,18 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 		var finalTop, finalRight, finalBottom, finalLeft uint8
 		var paddingErr error
 		if foundPaddingLong { // Long form (padding_top etc.) takes precedence if mixed
-			if parsedPaddingTop != nil { finalTop = *parsedPaddingTop }
-			if parsedPaddingRight != nil { finalRight = *parsedPaddingRight }
-			if parsedPaddingBottom != nil { finalBottom = *parsedPaddingBottom }
-			if parsedPaddingLeft != nil { finalLeft = *parsedPaddingLeft }
+			if parsedPaddingTop != nil {
+				finalTop = *parsedPaddingTop
+			}
+			if parsedPaddingRight != nil {
+				finalRight = *parsedPaddingRight
+			}
+			if parsedPaddingBottom != nil {
+				finalBottom = *parsedPaddingBottom
+			}
+			if parsedPaddingLeft != nil {
+				finalLeft = *parsedPaddingLeft
+			}
 			if foundPaddingShort {
 				log.Printf("L%d: Info: Padding shorthand for '%s' overridden by specific padding_* properties.", el.SourceLineNum, el.SourceElementName)
 			}
@@ -580,8 +661,8 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 					paddingErr = fmt.Errorf("parsing single padding value '%s': %w", parts[0], e)
 				}
 			case 2:
-				v1, e1 := strconv.ParseUint(parts[0], 10, 8) // vertical
-				v2, e2 := strconv.ParseUint(parts[1], 10, 8) // horizontal
+				v1, e1 := strconv.ParseUint(parts[0], 10, 8)
+				v2, e2 := strconv.ParseUint(parts[1], 10, 8)
 				if e1 == nil && e2 == nil {
 					vt, hz := uint8(v1), uint8(v2)
 					finalTop, finalBottom = vt, vt
@@ -597,84 +678,76 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 				if e1 == nil && e2 == nil && e3 == nil && e4 == nil {
 					finalTop, finalRight, finalBottom, finalLeft = uint8(v1), uint8(v2), uint8(v3), uint8(v4)
 				} else {
-					paddingErr = fmt.Errorf("parsing 4-value padding '%s %s %s %s': e1=%v, e2=%v, e3=%v, e4=%v", parts[0], parts[1], parts[2], parts[3], e1, e2, e3, e4)
+					paddingErr = fmt.Errorf("parsing 4-value padding: e1=%v..e4=%v", e1, e2, e3, e4)
 				}
 			default:
-				paddingErr = fmt.Errorf("invalid number of values (%d) for 'padding' shorthand: '%s'. Expected 1, 2, or 4 values.", len(parts), parsedPaddingShort)
+				paddingErr = fmt.Errorf("invalid number of values (%d) for 'padding' shorthand: '%s'. Expected 1, 2, or 4.", len(parts), parsedPaddingShort)
 			}
 		}
 		if paddingErr != nil {
 			return fmt.Errorf("L%d: error finalizing padding for element '%s': %w", el.SourceLineNum, el.SourceElementName, paddingErr)
 		}
-		// Add the resolved padding as a single KRB property
 		if addErr := el.addKrbProperty(PropIDPadding, ValTypeEdgeInsets, []byte{finalTop, finalRight, finalBottom, finalLeft}); addErr != nil {
 			return fmt.Errorf("L%d: error adding KRB padding property for element '%s': %w", el.SourceLineNum, el.SourceElementName, addErr)
 		}
 	}
 	// (Similar finalization for margin if complex margin parsing is implemented)
 
-	// --- Step 3.5: Add _componentName Custom Property for Instances ---
-	if el.IsComponentInstance && el.ComponentDef != nil {
-		keyIdx, keyErr := state.addString(componentNameConventionKey)
-		valIdx, valErr := state.addString(el.ComponentDef.Name)
-		if keyErr == nil && valErr == nil {
-			if len(el.KrbCustomProperties) < MaxCustomProperties {
-				el.KrbCustomProperties = append(el.KrbCustomProperties, KrbCustomProperty{
-					KeyIndex: keyIdx, ValueType: ValTypeString, Size: 1, Value: []byte{valIdx},
-				})
-			} else {
-				log.Printf("L%d: Warn: Max custom KRB properties reached, cannot add _componentName for instance of '%s'.", el.SourceLineNum, el.ComponentDef.Name)
-			}
-		} else {
-			log.Printf("L%d: Warn: Failed to add string for _componentName convention (keyErr: %v, valErr: %v)", el.SourceLineNum, keyErr, valErr)
-		}
+	// --- Step 4: Finalize Layout Byte ---
+	// `el.LayoutFlagsSource` was set from the KRY `layout:` string earlier.
+	// Now, incorporate style's layout. Element's direct `layout:` wins over style's.
+	finalLayoutByte := el.LayoutFlagsSource // Start with explicit layout from element if any
+	// layoutSourceReason := "" // For debugging
+
+	if el.LayoutFlagsSource != 0 {
+		// layoutSourceReason = "Explicit on Element"
 	}
 
-	// --- Step 4: Finalize Layout Byte ---
-	var finalLayout uint8                              // Declare finalLayout
-	layoutSource := "Default (Column|Start)"           // Declare and initialize layoutSource ONCE
-	// Note: el.LayoutFlagsSource is from the KRY `layout:` property on the element itself.
-
-	styleLayoutByte := uint8(0)
-	styleLayoutFound := false
 	if el.StyleID > 0 { // If a style is applied
 		if style := state.findStyleByID(el.StyleID); style != nil && style.IsResolved {
-			for _, p := range style.Properties { // Check for PropIDLayoutFlags in the style's KRB properties
+			styleLayoutByteValue := uint8(0)
+			foundLayoutInStyle := false
+			for _, p := range style.Properties { // Check for PropIDLayoutFlags in the style's *resolved KRB properties*
 				if p.PropertyID == PropIDLayoutFlags && p.ValueType == ValTypeByte && p.Size == 1 {
-					styleLayoutByte = p.Value[0]
-					styleLayoutFound = true
+					styleLayoutByteValue = p.Value[0]
+					foundLayoutInStyle = true
 					break
 				}
 			}
-		} else if style != nil && !style.IsResolved {
-			// This should ideally not happen if style resolution pass is complete and successful.
-			log.Printf("L%d: CRITICAL WARN: Style ID %d ('%s') applied to element '%s' was not resolved prior to layout finalization!", el.SourceLineNum, el.StyleID, style.SourceName, el.SourceElementName)
+
+			if foundLayoutInStyle && el.LayoutFlagsSource == 0 { // If element had NO explicit layout, use style's
+				finalLayoutByte = styleLayoutByteValue
+				// layoutSourceReason = "From Style"
+			}
+			// If element HAS explicit layout (LayoutFlagsSource != 0), it already won.
 		}
 	}
 
-	if el.LayoutFlagsSource != 0 { // Explicit 'layout:' on element wins
-		finalLayout = el.LayoutFlagsSource
-		layoutSource = "Explicit on Element"
-	} else if styleLayoutFound { // Fallback to layout from style
-		finalLayout = styleLayoutByte
-		layoutSource = "From Style"
-	} else { // Overall default if neither element nor style specifies layout
-		finalLayout = LayoutDirectionColumn | LayoutAlignmentStart // Default: column, start
-		// layoutSource remains "Default (Column|Start)"
+	if finalLayoutByte == 0 { // If still no layout defined by element or style, apply default
+		finalLayoutByte = LayoutDirectionColumn | LayoutAlignmentStart // Default: column, start
+		// layoutSourceReason = "Default (Column|Start)"
 	}
-	el.Layout = finalLayout // Set the final layout byte on the element
-
-	// Optional logging for non-default layouts:
-	if layoutSource != "Default (Column|Start)" || finalLayout != (LayoutDirectionColumn|LayoutAlignmentStart) {
-		// log.Printf("   >> Elem %d ('%s', L%d) Layout: 0x%02X (Source: %s)\n", el.SelfIndex, el.SourceElementName, el.SourceLineNum, el.Layout, layoutSource)
-	}
+	el.Layout = finalLayoutByte // Set the final layout byte on the element
 
 	// --- Step 5: Recursively Resolve Children ---
-	el.Children = make([]*Element, 0, len(el.SourceChildrenIndices))
+	// This logic applies to ALL elements (standard, placeholders, template parts).
+	// For placeholders, el.SourceChildrenIndices are children from the KRY *usage tag*.
+	// For template parts, el.SourceChildrenIndices are children *within* that template definition.
+	el.Children = make([]*Element, 0, len(el.SourceChildrenIndices)) // Reset for this resolution pass
 	for _, childIndexInState := range el.SourceChildrenIndices {
 		if childIndexInState < 0 || childIndexInState >= len(state.Elements) {
 			return fmt.Errorf("L%d: element '%s' (idx %d) has invalid child index %d in SourceChildrenIndices", el.SourceLineNum, el.SourceElementName, el.SelfIndex, childIndexInState)
 		}
+
+		childEl := &state.Elements[childIndexInState]
+
+		// Propagate template context: If current element `el` is part of a component's definition template
+		// (i.e., it's a "definition root" itself OR its parent was one), then its direct children
+		// from the KRY source are also considered part of that same template structure.
+		if el.IsDefinitionRoot { // This check implies el itself is part of *some* template
+			childEl.IsDefinitionRoot = true
+		}
+
 		if err := state.resolveElementRecursive(childIndexInState); err != nil {
 			childName := fmt.Sprintf("index %d", childIndexInState)
 			if childIndexInState < len(state.Elements) {
@@ -682,17 +755,87 @@ func (state *CompilerState) resolveElementRecursive(elementIndex int) error {
 			}
 			return fmt.Errorf("error resolving child %s of element '%s' (L%d): %w", childName, el.SourceElementName, el.SourceLineNum, err)
 		}
-		el.Children = append(el.Children, &state.Elements[childIndexInState])
+		el.Children = append(el.Children, childEl)
 	}
 
 	// --- Finalize Counts for KRB Header ---
 	el.PropertyCount = uint8(len(el.KrbProperties))
 	el.CustomPropCount = uint8(len(el.KrbCustomProperties))
 	el.EventCount = uint8(len(el.KrbEvents))
-	el.ChildCount = uint8(len(el.Children)) // Based on successfully resolved children
-	el.AnimationCount = 0                    // Not implemented
+	// el.ChildCount is based on the el.Children slice populated above,
+	// which reflects the correct context (instance children vs. template children).
+	el.ChildCount = uint8(len(el.Children))
+	el.AnimationCount = 0 // Not implemented
 
 	return nil
+}
+
+// applyStyleStringToElement attempts to parse a style string (single or array)
+// and set the element's StyleID.
+// For KRB's single StyleID, if an array is given, it currently warns and uses the first valid one.
+func (state *CompilerState) applyStyleStringToElement(el *Element, styleStr string, lineNum int) error {
+	cleanedFullStyleString, _ := cleanAndQuoteValue(styleStr) // Clean the whole string "value" part
+
+	if strings.HasPrefix(cleanedFullStyleString, "[") && strings.HasSuffix(cleanedFullStyleString, "]") {
+		// It's an array string, e.g., ["style1", "style2"]
+		content := cleanedFullStyleString[1 : len(cleanedFullStyleString)-1] // Remove brackets
+		parts := strings.Split(content, ",")
+		firstStyleNameFound := ""
+
+		if len(parts) > 0 {
+			for _, partStr := range parts {
+				// Each part inside the array should be a quoted string like "style_name"
+				individualName, wasQuoted := cleanAndQuoteValue(strings.TrimSpace(partStr))
+				if wasQuoted && individualName != "" {
+					firstStyleNameFound = individualName
+					break // Found the first valid style name in the array
+				}
+			}
+		}
+
+		if firstStyleNameFound != "" {
+			if len(parts) > 1 { // Only log warning if there actually were multiple styles listed
+				log.Printf("L%d: Warn: Element '%s' uses array style '%s'. KRB supports only one StyleID per element. Applying first valid style '%s'. True multi-style application needs runtime support.", lineNum, el.SourceElementName, styleStr, firstStyleNameFound)
+			}
+			styleID := state.findStyleIDByName(firstStyleNameFound)
+			if styleID == 0 { // First style name from array not found
+				log.Printf("L%d: Warn: Style '%s' (from array style for element '%s') not found.", lineNum, firstStyleNameFound, el.SourceElementName)
+			}
+			el.StyleID = styleID
+		} else { // Array was empty "[]" or contained no valid quoted style names
+			log.Printf("L%d: Warn: Element '%s' has empty or invalid array style definition: '%s'. No style applied from this definition.", lineNum, el.SourceElementName, styleStr)
+			el.StyleID = 0 // Explicitly no style if array is invalid/empty
+		}
+		return nil
+	}
+
+	// Single style name (not an array format)
+	if cleanedFullStyleString != "" {
+		styleID := state.findStyleIDByName(cleanedFullStyleString)
+		if styleID == 0 {
+			// This is the warning for `style: "non_existent_style"`
+			// And also for the previous error `style: ["s1","s2"]` if it wasn't caught by the array check above
+			log.Printf("L%d: Warn: Style '%s' not found for element '%s'.\n", lineNum, cleanedFullStyleString, el.SourceElementName)
+		}
+		el.StyleID = styleID
+	} else {
+		el.StyleID = 0 // Empty style string e.g. style: "" means no style
+	}
+	return nil
+}
+
+// isEventKey checks if a KRY property key is an event handler.
+func isEventKey(key string) bool {
+	// Add more event keys as your KRY spec defines them
+	switch key {
+	case "onClick", "on_click",
+		"onSubmit", "on_submit",
+		"onChange", "on_change":
+		// Add more cases here: "onHover", "onFocus", etc.
+		return true
+	default:
+		return false
+	}
 }
 
 // --- Helper Functions ---
@@ -798,7 +941,7 @@ func parseKryValueToKrbBytes(state *CompilerState, valStr string, hint uint8, pr
 				percentOnlyStr := strings.TrimSuffix(valStr, "%")
 				if f2, pErr2 := strconv.ParseFloat(percentOnlyStr, 64); pErr2 == nil {
 					f = f2 / 100.0 // Convert "50" from "50%" to 0.5
-					pErr = nil      // Clear previous parsing error
+					pErr = nil     // Clear previous parsing error
 				} else {
 					return nil, 0, 0, fmt.Errorf("invalid Percentage string value '%s' for custom prop '%s': %w", valStr, propKey, pErr2)
 				}
@@ -810,7 +953,7 @@ func parseKryValueToKrbBytes(state *CompilerState, valStr string, hint uint8, pr
 		fpVal := uint16(math.Round(f * 256.0))
 		buf := make([]byte, 2)
 		binary.LittleEndian.PutUint16(buf, fpVal)
-		state.HeaderFlags |= FlagFixedPoint // Mark that fixed point values are used in the file
+		state.HeaderFlags |= FlagFixedPoint   // Mark that fixed point values are used in the file
 		return buf, ValTypePercentage, 2, nil // KRB ValueType is Percentage (which means 8.8 fixed point)
 
 	default: // ValTypeCustom hint from KRY or other unhandled KRY type hints for custom props
@@ -895,7 +1038,7 @@ func addFixedPointProp(el *Element, propID uint8, cleanValStr string, headerFlag
 			trimmedPercent := strings.TrimSuffix(cleanValStr, "%")
 			if f2, pErr2 := strconv.ParseFloat(trimmedPercent, 64); pErr2 == nil {
 				f = f2 / 100.0 // Convert "50" from "50%" to 0.5
-				err = nil     // Clear the original parsing error
+				err = nil      // Clear the original parsing error
 			} else {
 				return fmt.Errorf("prop ID 0x%X: invalid percentage string in fixed point prop '%s': %w", propID, cleanValStr, pErr2)
 			}
@@ -906,8 +1049,12 @@ func addFixedPointProp(el *Element, propID uint8, cleanValStr string, headerFlag
 
 	// For opacity, clamp to 0.0-1.0 range. For other fixed-point props, this might not be necessary.
 	if propID == PropIDOpacity {
-		if f < 0.0 { f = 0.0 }
-		if f > 1.0 { f = 1.0 }
+		if f < 0.0 {
+			f = 0.0
+		}
+		if f > 1.0 {
+			f = 1.0
+		}
 	}
 	// For aspect ratio, ensure non-negative
 	if propID == PropIDAspectRatio && f < 0.0 {
